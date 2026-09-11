@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ghost Escape — Level 1</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0b1026">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="description" content="A cute little ghost puzzle game. Possess objects, dodge the light, escape the room.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>%F0%9F%91%BB</text></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="stage">
+  <div id="frame">
+    <canvas id="game"></canvas>
+
+    <!-- ============ HUD ============ -->
+    <div id="hud">
+      <div id="hud-top">
+        <div id="level-box">
+          <div class="level-title">Level 1</div>
+          <div class="level-sub" id="objective">Reach the exit</div>
+        </div>
+        <button id="btn-restart" class="icon-btn" aria-label="Restart level">
+          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+            <path d="M12 5V2L7 6l5 4V7a5 5 0 1 1-5 5H5a7 7 0 1 0 7-7z" fill="currentColor"/>
+          </svg>
+        </button>
+      </div>
+
+      <div id="toast"></div>
+
+      <!-- ============ CONTROLS ============ -->
+      <div id="joystick" aria-hidden="true">
+        <div id="joy-base"></div>
+        <div id="joy-knob"></div>
+      </div>
+
+      <div id="action-stack">
+        <button id="btn-release" class="action-btn secondary hidden">RELEASE</button>
+        <button id="btn-action" class="action-btn hidden">POSSESS</button>
+      </div>
+    </div>
+
+    <!-- ============ OVERLAYS ============ -->
+    <div id="overlay" class="hidden">
+      <div class="panel">
+        <h1 id="ov-title">LEVEL COMPLETE!</h1>
+        <p id="ov-text">The little ghost is free.</p>
+        <div class="panel-buttons">
+          <button id="btn-next" class="menu-btn primary">NEXT LEVEL</button>
+          <button id="btn-again" class="menu-btn">RESTART</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="intro">
+      <div class="panel">
+        <div class="intro-ghost">👻</div>
+        <h1>GHOST ESCAPE</h1>
+        <p class="intro-body">
+          Stay in the shadows.<br>
+          Warm light burns little ghosts.<br>
+          <strong>Possess</strong> objects to change the room.
+        </p>
+        <div class="intro-keys">Move: joystick · WASD · Arrows &nbsp;|&nbsp; Action: E / Space</div>
+        <button id="btn-start" class="menu-btn primary">PLAY</button>
+      </div>
+    </div>
+
+    <div id="flash"></div>
+  </div>
+</div>
+
+<script src="game.js"></script>
+</body>
+</html>

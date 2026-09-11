@@ -1,0 +1,1979 @@
+/* =============================================================================
+   GHOST ESCAPE — Level 1 prototype
+   Vanilla HTML5 / Canvas. No dependencies.
+
+   Systems in this file, in order:
+     0. Constants + math helpers
+     1. SFX          — tiny Web Audio blip synth (lazy, user-gesture safe)
+     2. Particles    — one flat particle pool
+     3. Input        — keyboard + virtual joystick + action buttons
+     4. Collision    — circle vs AABB / circle, swept-ish resolve
+     5. Entities     — Ghost, Possessable(Lamp/ToyCar/Fan), PressurePlate,
+                       ExitDoor, LightHazard
+     6. Level        — the single room for level 1
+     7. Render       — procedural cozy room drawing
+     8. Game         — state machine, loop, UI glue
+   ============================================================================= */
+(() => {
+'use strict';
+
+/* =============================================================================
+   0. CONSTANTS + HELPERS
+   ============================================================================= */
+
+const W = 540, H = 960;                               // logical design size (9:16)
+const ROOM = { x0: 24, y0: 24, x1: 516, y1: 936 };    // playable interior
+const DIV  = { y0: 520, y1: 548, gx0: 228, gx1: 330 };// divider wall + doorway gap
+const DOOR = { x0: 202, x1: 286 };                    // exit opening in the top wall
+
+const DANGER_TIME  = 1.5;   // seconds in light before the level restarts
+const POSSESS_DIST = 82;    // how close the ghost must be to possess
+
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp  = (a, b, t) => a + (b - a) * t;
+const dist  = (x1, y1, x2, y2) => Math.hypot(x2 - x1, y2 - y1);
+const rand  = (a, b) => a + Math.random() * (b - a);
+const pick  = arr => arr[(Math.random() * arr.length) | 0];
+
+// frame-rate independent smoothing: how much of the way to `to` we travel in dt
+const smooth = (dt, per) => 1 - Math.pow(per, dt);
+
+function angDiff(a, b) {
+  let d = (a - b) % TAU;
+  if (d >  Math.PI) d -= TAU;
+  if (d < -Math.PI) d += TAU;
+  return d;
+}
+
+/** Rounded-rect path (hand rolled: Safari support for ctx.roundRect is recent). */
+function rr(ctx, x, y, w, h, r) {
+  r = Math.min(r, Math.abs(w) / 2, Math.abs(h) / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+/** Soft elliptical drop shadow used under every prop. */
+function softShadow(ctx, x, y, rx, ry, a) {
+  const g = ctx.createRadialGradient(x, y, 0, x, y, Math.max(rx, ry));
+  g.addColorStop(0, 'rgba(0,0,0,' + (a === undefined ? 0.38 : a) + ')');
+  g.addColorStop(0.6, 'rgba(0,0,0,' + (a === undefined ? 0.18 : a * 0.45) + ')');
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.save();
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.ellipse(x, y, rx, ry, 0, 0, TAU);
+  ctx.fill();
+  ctx.restore();
+}
+
+/* =============================================================================
+   1. SFX — placeholder Web Audio blips. Never blocks the game if unavailable.
+   ============================================================================= */
+
+const SFX = {
+  ctx: null, master: null, ok: false, muted: false,
+
+  init() {                                  // called from the first user gesture
+    if (this.ok) { this.resume(); return; }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    try {
+      this.ctx = new AC();
+      this.master = this.ctx.createGain();
+      this.master.gain.value = 0.22;
+      this.master.connect(this.ctx.destination);
+      this.ok = true;
+    } catch (e) { this.ok = false; }
+  },
+  resume() {
+    if (this.ok && this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+  },
+  tone(freq, dur, type, vol, slideTo, delay) {
+    if (!this.ok || this.muted) return;
+    try {
+      const t = this.ctx.currentTime + (delay || 0);
+      const o = this.ctx.createOscillator();
+      const g = this.ctx.createGain();
+      o.type = type || 'sine';
+      o.frequency.setValueAtTime(freq, t);
+      if (slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(30, slideTo), t + dur);
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(Math.max(0.02, vol === undefined ? 0.4 : vol), t + 0.015);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(g); g.connect(this.master);
+      o.start(t); o.stop(t + dur + 0.03);
+    } catch (e) { /* audio must never break the game */ }
+  },
+  noise(dur, vol) {
+    if (!this.ok || this.muted) return;
+    try {
+      const n = Math.floor(this.ctx.sampleRate * dur);
+      const buf = this.ctx.createBuffer(1, n, this.ctx.sampleRate);
+      const d = buf.getChannelData(0);
+      for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+      const s = this.ctx.createBufferSource(); s.buffer = buf;
+      const f = this.ctx.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 900;
+      const g = this.ctx.createGain(); g.gain.value = vol || 0.25;
+      s.connect(f); f.connect(g); g.connect(this.master);
+      s.start();
+    } catch (e) {}
+  },
+
+  possess()  { this.tone(300, 0.28, 'sine', 0.35, 760); this.tone(600, 0.22, 'triangle', 0.12, 1200, 0.03); },
+  release()  { this.tone(720, 0.22, 'sine', 0.3, 320); },
+  toggleOn() { this.tone(420, 0.12, 'square', 0.12); this.tone(640, 0.14, 'sine', 0.18, 0, 0.05); },
+  toggleOff(){ this.tone(320, 0.16, 'square', 0.12, 160); },
+  plate()    { this.tone(392, 0.14, 'triangle', 0.3); this.tone(587, 0.22, 'triangle', 0.26, 0, 0.09); },
+  unlock()   { [523, 659, 784].forEach((f, i) => this.tone(f, 0.3, 'sine', 0.3, 0, i * 0.09)); this.noise(0.25, 0.12); },
+  hurt()     { this.tone(180, 0.3, 'sawtooth', 0.16, 90); },
+  fail()     { this.tone(330, 0.5, 'sine', 0.3, 110); this.noise(0.4, 0.18); },
+  win()      { [523, 659, 784, 1046].forEach((f, i) => this.tone(f, 0.45, 'sine', 0.32, 0, i * 0.11)); },
+  step()     { this.tone(rand(600, 900), 0.05, 'sine', 0.05); }
+};
+
+/* =============================================================================
+   2. PARTICLES — single pool, drawn additively for the glowy ones
+   ============================================================================= */
+
+const Particles = {
+  list: [],
+  MAX: 420,
+
+  spawn(o) {
+    if (this.list.length >= this.MAX) this.list.shift();
+    this.list.push({
+      x: 0, y: 0, vx: 0, vy: 0, life: 0.6, max: 0.6,
+      size: 4, color: '#a9e2ff', glow: true, drag: 0.9,
+      grav: 0, rot: 0, spin: 0, shape: 'dot', ...o
+    });
+    const p = this.list[this.list.length - 1];
+    p.max = p.life;
+  },
+
+  burst(x, y, n, o) {
+    for (let i = 0; i < n; i++) {
+      const a = rand(0, TAU), s = rand((o && o.spdMin) || 40, (o && o.spdMax) || 170);
+      this.spawn({
+        x: x + rand(-4, 4), y: y + rand(-4, 4),
+        vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+        life: rand(0.35, 0.9),
+        size: rand(2.5, 6),
+        color: o && o.colors ? pick(o.colors) : '#a9e2ff',
+        glow: !o || o.glow !== false,
+        grav: (o && o.grav) || 0,
+        shape: (o && o.shape) || 'dot'
+      });
+    }
+  },
+
+  update(dt) {
+    const l = this.list;
+    for (let i = l.length - 1; i >= 0; i--) {
+      const p = l[i];
+      p.life -= dt;
+      if (p.life <= 0) { l.splice(i, 1); continue; }
+      const d = Math.pow(p.drag, dt * 60);
+      p.vx *= d; p.vy *= d;
+      p.vy += p.grav * dt;
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.rot += p.spin * dt;
+    }
+  },
+
+  draw(ctx) {
+    for (const p of this.list) {
+      const t = clamp(p.life / p.max, 0, 1);
+      ctx.save();
+      ctx.globalAlpha = t;
+      if (p.glow) ctx.globalCompositeOperation = 'lighter';
+      ctx.fillStyle = p.color;
+      if (p.shape === 'star') {
+        ctx.translate(p.x, p.y); ctx.rotate(p.rot);
+        const s = p.size * (0.6 + t * 0.8);
+        ctx.beginPath();
+        for (let i = 0; i < 8; i++) {
+          const a = (i / 8) * TAU, r = i % 2 ? s * 0.4 : s;
+          ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r);
+        }
+        ctx.closePath(); ctx.fill();
+      } else if (p.shape === 'ring') {
+        ctx.strokeStyle = p.color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size * (1 + (1 - t) * 3), 0, TAU);
+        ctx.stroke();
+      } else {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size * (0.35 + t * 0.8), 0, TAU);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+  },
+
+  clear() { this.list.length = 0; }
+};
+
+/* =============================================================================
+   3. INPUT — keyboard + dynamic virtual joystick (pointer events)
+   ============================================================================= */
+
+const Input = {
+  keys: Object.create(null),
+  joy: { active: false, id: null, dx: 0, dy: 0 },
+  actionEdge: false,     // consumed once per press
+  releaseEdge: false,
+
+  el: null, knob: null, frame: null,
+  homeLeft: 0, homeTop: 0, radius: 60,
+
+  init(frame, joyEl, knobEl) {
+    this.frame = frame; this.el = joyEl; this.knob = knobEl;
+
+    addEventListener('keydown', e => {
+      const k = e.key.toLowerCase();
+      if (!this.keys[k]) {
+        if (k === 'e' || k === ' ' || k === 'enter') this.actionEdge = true;
+        if (k === 'q' || k === 'escape') this.releaseEdge = true;
+      }
+      this.keys[k] = true;
+      if ([' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) e.preventDefault();
+      SFX.init();
+    }, { passive: false });
+
+    addEventListener('keyup', e => { this.keys[e.key.toLowerCase()] = false; });
+    addEventListener('blur', () => { this.keys = Object.create(null); this.endJoy(); });
+
+    // ---- virtual joystick: any touch in the lower-left region grabs it ----
+    frame.addEventListener('pointerdown', e => {
+      SFX.init();
+      if (this.joy.active) return;
+      const r = frame.getBoundingClientRect();
+      const lx = e.clientX - r.left, ly = e.clientY - r.top;
+      if (lx > r.width * 0.62 || ly < r.height * 0.52) return;   // keep the play area free
+      this.joy.active = true;
+      this.joy.id = e.pointerId;
+      this.radius = this.el.offsetWidth / 2;
+      this.el.style.left = (lx - this.radius) + 'px';
+      this.el.style.top  = (ly - this.radius) + 'px';
+      this.el.style.right = 'auto'; this.el.style.bottom = 'auto';
+      this.el.classList.add('active');
+      this.origin = { x: e.clientX, y: e.clientY };
+      this.move(e);
+      if (frame.setPointerCapture) { try { frame.setPointerCapture(e.pointerId); } catch (err) {} }
+      e.preventDefault();
+    }, { passive: false });
+
+    frame.addEventListener('pointermove', e => {
+      if (!this.joy.active || e.pointerId !== this.joy.id) return;
+      this.move(e);
+      e.preventDefault();
+    }, { passive: false });
+
+    const up = e => { if (this.joy.active && e.pointerId === this.joy.id) this.endJoy(); };
+    frame.addEventListener('pointerup', up);
+    frame.addEventListener('pointercancel', up);
+    addEventListener('pointerup', up);
+
+    // block browser gestures
+    ['gesturestart', 'gesturechange', 'contextmenu'].forEach(ev =>
+      document.addEventListener(ev, e => e.preventDefault(), { passive: false }));
+    document.addEventListener('dblclick', e => e.preventDefault(), { passive: false });
+
+    this.park();
+    addEventListener('resize', () => this.park());
+  },
+
+  park() {                                   // resting position, bottom-left
+    if (!this.el || this.joy.active) return;
+    const r = this.frame.getBoundingClientRect();
+    const size = this.el.offsetWidth || 120;
+    this.radius = size / 2;
+    this.homeLeft = r.width * 0.06;
+    this.homeTop  = r.height - size - r.height * 0.05;
+    this.el.style.left = this.homeLeft + 'px';
+    this.el.style.top = this.homeTop + 'px';
+    this.el.style.right = 'auto';
+    this.el.style.bottom = 'auto';
+  },
+
+  move(e) {
+    const max = this.radius * 0.72;
+    let dx = e.clientX - this.origin.x, dy = e.clientY - this.origin.y;
+    const d = Math.hypot(dx, dy);
+    if (d > max) { dx = dx / d * max; dy = dy / d * max; }
+    this.joy.dx = dx / max; this.joy.dy = dy / max;
+    this.knob.style.transform = `translate(${dx}px, ${dy}px)`;
+  },
+
+  endJoy() {
+    this.joy.active = false; this.joy.id = null;
+    this.joy.dx = this.joy.dy = 0;
+    if (this.knob) this.knob.style.transform = 'translate(0,0)';
+    if (this.el) { this.el.classList.remove('active'); this.park(); }
+  },
+
+  /** Combined movement vector, magnitude clamped to 1. */
+  vector() {
+    let x = 0, y = 0;
+    const k = this.keys;
+    if (k['a'] || k['arrowleft'])  x -= 1;
+    if (k['d'] || k['arrowright']) x += 1;
+    if (k['w'] || k['arrowup'])    y -= 1;
+    if (k['s'] || k['arrowdown'])  y += 1;
+    if (x || y) { const m = Math.hypot(x, y); x /= m; y /= m; }
+    if (this.joy.active) {
+      x += this.joy.dx; y += this.joy.dy;
+      const m = Math.hypot(x, y);
+      if (m > 1) { x /= m; y /= m; }
+    }
+    return { x, y, mag: Math.hypot(x, y) };
+  },
+
+  takeAction()  { const v = this.actionEdge;  this.actionEdge = false;  return v; },
+  takeRelease() { const v = this.releaseEdge; this.releaseEdge = false; return v; }
+};
+
+/* =============================================================================
+   4. COLLISION — circles against static AABBs and static circles
+   ============================================================================= */
+
+const Collide = {
+  /** Push a circle out of an axis-aligned box along the shallowest axis. */
+  circleRect(c, r) {
+    const nx = clamp(c.x, r.x, r.x + r.w);
+    const ny = clamp(c.y, r.y, r.y + r.h);
+    const dx = c.x - nx, dy = c.y - ny;
+    const d2 = dx * dx + dy * dy;
+    if (d2 > c.r * c.r) return false;
+
+    if (d2 > 0.0001) {                       // outside the box: push along normal
+      const d = Math.sqrt(d2);
+      const push = c.r - d;
+      c.x += (dx / d) * push;
+      c.y += (dy / d) * push;
+    } else {                                 // center inside: escape the nearest face
+      const left = c.x - r.x, right = r.x + r.w - c.x;
+      const top = c.y - r.y, bottom = r.y + r.h - c.y;
+      const m = Math.min(left, right, top, bottom);
+      if (m === left)       c.x = r.x - c.r;
+      else if (m === right) c.x = r.x + r.w + c.r;
+      else if (m === top)   c.y = r.y - c.r;
+      else                  c.y = r.y + r.h + c.r;
+    }
+    return true;
+  },
+
+  circleCircle(c, o) {
+    const dx = c.x - o.x, dy = c.y - o.y;
+    const rad = c.r + o.r;
+    const d = Math.hypot(dx, dy);
+    if (d >= rad) return false;
+    if (d < 0.0001) { c.y -= rad; return true; }
+    const push = rad - d;
+    c.x += (dx / d) * push;
+    c.y += (dy / d) * push;
+    return true;
+  },
+
+  /** Resolve a moving circle against the whole level. Returns true if it hit. */
+  resolve(body, level) {
+    let hit = false;
+    for (let pass = 0; pass < 2; pass++) {
+      for (const r of level.rects)   if (this.circleRect(body, r))   hit = true;
+      for (const o of level.circles) if (this.circleCircle(body, o)) hit = true;
+    }
+    return hit;
+  }
+};
+
+/* =============================================================================
+   5. ENTITIES
+   ============================================================================= */
+
+/** A cone of warm light. Dangerous ones burn the ghost. */
+class LightHazard {
+  constructor(o) {
+    Object.assign(this, {
+      x: 0, y: 0, dir: -Math.PI / 2, half: 0.85, len: 300,
+      on: true, dangerous: true,
+      nearSafe: 26,       // the bulb itself is not a kill zone
+      shaft: null,        // optional occluder: light only escapes through a gap
+      fade: 1, flicker: 0
+    }, o);
+    this.fade = this.on ? 1 : 0;
+  }
+
+  update(dt, time) {
+    this.fade = lerp(this.fade, this.on ? 1 : 0, smooth(dt, 0.0005));
+    this.flicker = 0.94 + Math.sin(time * 2.7) * 0.03 + Math.sin(time * 11.3) * 0.015;
+  }
+
+  get reach() { return this.len * this.fade; }
+
+  contains(x, y) {
+    if (!this.dangerous || this.fade < 0.4) return false;
+    const dx = x - this.x, dy = y - this.y;
+    const d = Math.hypot(dx, dy);
+    if (d > this.reach || d < this.nearSafe) return false;
+    if (Math.abs(angDiff(Math.atan2(dy, dx), this.dir)) > this.half) return false;
+    // beyond a wall the light only survives inside the doorway shaft
+    if (this.shaft && y < this.shaft.wallY0 && (x < this.shaft.gx0 || x > this.shaft.gx1)) return false;
+    return true;
+  }
+}
+
+/** Shared behaviour for everything the ghost can slip inside. */
+class Possessable {
+  constructor(o) {
+    Object.assign(this, {
+      x: 0, y: 0, r: 26, name: 'object',
+      possessed: false, highlight: 0, pop: 0, glow: 0
+    }, o);
+  }
+  /** Secondary label for the big button while possessed (null = plain RELEASE). */
+  actionLabel() { return null; }
+  activate() {}                       // pressing the big button while possessed
+  update(dt, input, level) {}
+  onPossess() { this.pop = 1; }
+  onRelease() { this.pop = 1; }
+  tickCommon(dt, nearGhost) {
+    this.highlight = lerp(this.highlight, nearGhost ? 1 : 0, smooth(dt, 0.002));
+    this.glow = lerp(this.glow, this.possessed ? 1 : 0, smooth(dt, 0.002));
+    this.pop = Math.max(0, this.pop - dt * 2.6);
+  }
+}
+
+/** Floor lamp: its cone is the wall of light blocking the doorway. */
+class FloorLamp extends Possessable {
+  constructor(x, y, light) {
+    super({ x, y, r: 30, name: 'lamp' });
+    this.light = light;
+    this.sway = 0;
+  }
+  get on() { return this.light.on; }
+  actionLabel() { return this.light.on ? 'TURN OFF' : 'TURN ON'; }
+  activate() {
+    this.light.on = !this.light.on;
+    this.pop = 1;
+    this.sway = 1;
+    if (this.light.on) {
+      SFX.toggleOn();
+      Particles.burst(this.x, this.y - 74, 14, { colors: ['#ffd88a', '#fff0c4'], spdMax: 120 });
+    } else {
+      SFX.toggleOff();
+      Particles.burst(this.x, this.y - 74, 18, { colors: ['#ffd88a', '#9fd8ff'], spdMax: 140, grav: 130 });
+    }
+    return true;
+  }
+  update(dt) { this.sway = Math.max(0, this.sway - dt * 1.8); }
+}
+
+/** Fan: flavour object, shows that possessables can behave differently. */
+class Fan extends Possessable {
+  constructor(x, y) {
+    super({ x, y, r: 28, name: 'fan' });
+    this.on = false;
+    this.spin = 0;
+    this.speed = 0;
+    this.windT = 0;
+  }
+  actionLabel() { return this.on ? 'TURN OFF' : 'TURN ON'; }
+  activate() {
+    this.on = !this.on;
+    this.pop = 1;
+    if (this.on) SFX.toggleOn(); else SFX.toggleOff();
+    return true;
+  }
+  update(dt) {
+    this.speed = lerp(this.speed, this.on ? 15 : 0, smooth(dt, 0.06));
+    this.spin += this.speed * dt;
+    if (this.on) {
+      this.windT += dt;
+      if (this.windT > 0.09) {
+        this.windT = 0;
+        Particles.spawn({
+          x: this.x + rand(-16, 16), y: this.y - 30,
+          vx: rand(-26, 26), vy: rand(-150, -95),
+          life: rand(0.5, 0.95), size: rand(1.5, 3),
+          color: 'rgba(190,225,255,0.85)', glow: true, drag: 0.985
+        });
+      }
+    }
+  }
+}
+
+/** Toy car: drives like a little wheeled thing and is heavy enough for plates. */
+class ToyCar extends Possessable {
+  constructor(x, y) {
+    super({ x, y, r: 17, name: 'car' });
+    this.angle = -Math.PI / 2;
+    this.speed = 0;
+    this.wheel = 0;
+    this.bump = 0;
+    this.engineT = 0;
+  }
+  update(dt, input, level) {
+    if (this.possessed) {
+      const mag = input.mag;
+      if (mag > 0.15) {
+        const target = Math.atan2(input.y, input.x);
+        const d = angDiff(target, this.angle);
+        // sharper turning while slow, like a toy on carpet
+        const turnRate = 4.6 + (1 - clamp(Math.abs(this.speed) / 150, 0, 1)) * 4.0;
+        const step = turnRate * dt;
+        this.angle += clamp(d, -step, step);
+        // don't accelerate straight into a wall-facing turn
+        const align = clamp(1 - Math.abs(d) / Math.PI, 0.25, 1);
+        this.speed = lerp(this.speed, 152 * mag * align, smooth(dt, 0.02));
+        this.engineT += dt;
+        if (this.engineT > 0.14) { this.engineT = 0; SFX.tone(rand(90, 130), 0.07, 'sawtooth', 0.05); }
+      } else {
+        this.speed = lerp(this.speed, 0, smooth(dt, 0.0004));
+      }
+    } else {
+      this.speed = lerp(this.speed, 0, smooth(dt, 0.00001));
+    }
+
+    if (Math.abs(this.speed) > 1) {
+      const px = this.x, py = this.y;
+      this.x += Math.cos(this.angle) * this.speed * dt;
+      this.y += Math.sin(this.angle) * this.speed * dt;
+      if (Collide.resolve(this, level)) {
+        this.speed *= 0.35;
+        this.bump = 1;
+      }
+      this.wheel += dist(px, py, this.x, this.y) * 0.16;
+    }
+    this.bump = Math.max(0, this.bump - dt * 3);
+  }
+}
+
+/** Weight-activated floor plate. A ghost is far too light for it. */
+class PressurePlate {
+  constructor(x, y) {
+    this.x = x; this.y = y; this.r = 38;
+    this.pressed = false;
+    this.press = 0;
+    this.pulse = 0;
+    this.ring = 0;
+  }
+  update(dt, level) {
+    const car = level.car;
+    const on = dist(car.x, car.y, this.x, this.y) < this.r - 6;
+    if (on !== this.pressed) {
+      this.pressed = on;
+      this.pulse = 1;
+      if (on) {
+        SFX.plate();
+        Particles.burst(this.x, this.y, 22, { colors: ['#9dffc8', '#d9ffe9', '#7fd4ff'], spdMax: 150 });
+        Particles.spawn({ x: this.x, y: this.y, vx: 0, vy: 0, life: 0.6, size: 18, color: '#9dffc8', shape: 'ring' });
+      }
+    }
+    this.press = lerp(this.press, on ? 1 : 0, smooth(dt, 0.0006));
+    this.pulse = Math.max(0, this.pulse - dt * 1.6);
+    this.ring += dt * (on ? 1.6 : 0.4);
+  }
+}
+
+/** The way out. Locked until the plate stays pressed. */
+class ExitDoor {
+  constructor() {
+    this.x0 = DOOR.x0; this.x1 = DOOR.x1;
+    this.locked = true;
+    this.open = 0;
+    this.shake = 0;
+    this.glow = 0;
+  }
+  setLocked(v) {
+    if (this.locked === v) return;
+    this.locked = v;
+    this.shake = 1;
+    const cx = (this.x0 + this.x1) / 2;
+    if (!v) {
+      SFX.unlock();
+      Particles.burst(cx, 58, 30, { colors: ['#fff2c8', '#9dffc8', '#ffd88a'], spdMax: 190, grav: 120 });
+      Particles.spawn({ x: cx, y: 58, vx: 0, vy: 0, life: 0.8, size: 22, color: '#ffe6a8', shape: 'ring' });
+    } else {
+      SFX.toggleOff();
+    }
+  }
+  update(dt) {
+    this.open = lerp(this.open, this.locked ? 0 : 1, smooth(dt, 0.004));
+    this.shake = Math.max(0, this.shake - dt * 2.2);
+    this.glow = this.open;
+  }
+  reached(g) {
+    return !this.locked && g.y < 104 && g.x > this.x0 - 10 && g.x < this.x1 + 10;
+  }
+}
+
+/** The star of the show. */
+class Ghost {
+  constructor(x, y) {
+    this.spawnX = x; this.spawnY = y;
+    this.reset();
+  }
+  reset() {
+    this.x = this.spawnX; this.y = this.spawnY;
+    this.r = 15;
+    this.vx = 0; this.vy = 0;
+    this.t = rand(0, 10);
+    this.danger = 0;
+    this.hidden = false;
+    this.face = 0;         // eye look direction (-1..1)
+    this.squash = 0;
+    this.trailT = 0;
+    this.blink = rand(1.5, 4);
+    this.blinkT = 0;
+  }
+
+  update(dt, input, level) {
+    this.t += dt;
+
+    // --- blinking keeps it alive while idle ---
+    this.blink -= dt;
+    if (this.blink <= 0) { this.blinkT = 0.14; this.blink = rand(2.2, 5.5); }
+    this.blinkT = Math.max(0, this.blinkT - dt);
+
+    if (this.hidden) { this.danger = Math.max(0, this.danger - dt * 2); return; }
+
+    const inLight = level.lightAt(this.x, this.y);
+    const maxSpd = inLight ? 112 : 176;      // the light saps a little ghost
+    const tx = input.x * maxSpd, ty = input.y * maxSpd;
+    const k = smooth(dt, input.mag > 0.05 ? 0.0006 : 0.00004);
+    this.vx = lerp(this.vx, tx, k);
+    this.vy = lerp(this.vy, ty, k);
+
+    this.x += this.vx * dt;
+    this.y += this.vy * dt;
+    Collide.resolve(this, level);
+    this.x = clamp(this.x, ROOM.x0 - 4, ROOM.x1 + 4);
+    this.y = clamp(this.y, -30, ROOM.y1 + 4);
+
+    const sp = Math.hypot(this.vx, this.vy);
+    this.squash = lerp(this.squash, clamp(sp / 240, 0, 0.5), smooth(dt, 0.002));
+    if (Math.abs(this.vx) > 12) this.face = lerp(this.face, clamp(this.vx / 150, -1, 1), smooth(dt, 0.01));
+
+    // wispy trail
+    if (sp > 45) {
+      this.trailT += dt;
+      if (this.trailT > 0.045) {
+        this.trailT = 0;
+        Particles.spawn({
+          x: this.x + rand(-5, 5), y: this.y + rand(0, 9),
+          vx: -this.vx * 0.12 + rand(-12, 12), vy: -this.vy * 0.12 + rand(-8, 14),
+          life: rand(0.3, 0.62), size: rand(2.5, 5.5),
+          color: inLight ? 'rgba(255,190,150,0.9)' : 'rgba(150,215,255,0.9)', drag: 0.93
+        });
+      }
+    }
+
+    // --- light danger timer ---
+    if (inLight) {
+      if (this.danger === 0) SFX.hurt();
+      this.danger = Math.min(DANGER_TIME, this.danger + dt);
+      if (Math.random() < dt * 22) {
+        Particles.spawn({
+          x: this.x + rand(-12, 12), y: this.y + rand(-14, 8),
+          vx: rand(-20, 20), vy: rand(-70, -30),
+          life: rand(0.3, 0.6), size: rand(2, 4.5), color: '#ffcf9a'
+        });
+      }
+    } else {
+      this.danger = Math.max(0, this.danger - dt * 1.35);
+    }
+  }
+}
+
+/* =============================================================================
+   6. LEVEL — the single cozy room
+   ============================================================================= */
+
+function buildLevel() {
+  const L = {};
+
+  // ---- static colliders (walls are thick and reach outside the frame) ----
+  L.rects = [
+    { x: -60, y: 0, w: 84, h: H },                                  // left wall
+    { x: ROOM.x1, y: 0, w: 84, h: H },                              // right wall
+    { x: 0, y: ROOM.y1, w: W, h: 84 },                              // bottom wall
+    { x: -60, y: -60, w: 60 + DOOR.x0, h: 84 },                     // top wall, left of door
+    { x: DOOR.x1, y: -60, w: W - DOOR.x1 + 60, h: 84 },             // top wall, right of door
+    { x: DOOR.x0, y: -90, w: DOOR.x1 - DOOR.x0, h: 96 },            // the door itself
+    { x: -60, y: DIV.y0, w: 60 + DIV.gx0, h: DIV.y1 - DIV.y0 },     // divider, left half
+    { x: DIV.gx1, y: DIV.y0, w: W - DIV.gx1 + 60, h: DIV.y1 - DIV.y0 }, // divider, right half
+
+    // ---- furniture (these double as the drawing list) ----
+    { x: 50,  y: 612, w: 150, h: 92,  kind: 'sofa' },
+    { x: 330, y: 676, w: 112, h: 74,  kind: 'table' },
+    { x: 206, y: 884, w: 130, h: 44,  kind: 'tv' },
+    { x: 44,  y: 330, w: 156, h: 180, kind: 'bed' },
+    { x: 420, y: 400, w: 92,  h: 100, kind: 'dresser' },
+    { x: 210, y: 330, w: 56,  h: 56,  kind: 'nightstand' }
+  ];
+
+  L.circles = [
+    { x: 492, y: 880, r: 24, kind: 'plant', seed: 1 },
+    { x: 62,  y: 566, r: 20, kind: 'plant', seed: 2 },
+    { x: 148, y: 182, r: 20, kind: 'plant', seed: 3 },
+    { x: 470, y: 620, r: 24, kind: 'fanbase' },
+    { x: 222, y: 700, r: 16, kind: 'lampbase' },
+    { x: 470, y: 300, r: 15, kind: 'nightlamp' }
+  ];
+
+  // ---- lights ----
+  // 1) the floor lamp: a wall of light across the only doorway
+  L.lampLight = new LightHazard({
+    x: 222, y: 700, dir: -Math.PI / 2, half: 0.95, len: 400,
+    on: true, dangerous: true, nearSafe: 30,
+    shaft: { wallY0: DIV.y0, wallY1: DIV.y1, gx0: DIV.gx0 - 6, gx1: DIV.gx1 + 6 }
+  });
+  // 2) a small night lamp upstairs — atmosphere plus a hazard beside the plate
+  L.nightLight = new LightHazard({
+    x: 470, y: 300, dir: -Math.PI / 2, half: 0.70, len: 210,
+    on: true, dangerous: true, nearSafe: 22
+  });
+  // 3) warm glow spilling under the exit door (harmless, it is the goal)
+  L.doorLight = new LightHazard({
+    x: (DOOR.x0 + DOOR.x1) / 2, y: 44, dir: Math.PI / 2, half: 0.62, len: 150,
+    on: false, dangerous: false, nearSafe: 0
+  });
+
+  L.lights = [L.lampLight, L.nightLight, L.doorLight];
+
+  // ---- interactive props ----
+  L.lamp = new FloorLamp(222, 700, L.lampLight);
+  L.car  = new ToyCar(370, 452);
+  L.fan  = new Fan(470, 620);
+  L.possessables = [L.lamp, L.car, L.fan];
+
+  L.plate = new PressurePlate(330, 170);
+  L.door  = new ExitDoor();
+
+  // ---- decor (no collision) ----
+  L.rug = { x: 262, y: 790, rx: 142, ry: 92 };
+  // little cushions / books scattered around, purely decorative
+  L.decor = [
+    { x: 226, y: 742, r: 15, kind: 'cushion', hue: '#5b6bb8' },
+    { x: 196, y: 812, r: 13, kind: 'cushion', hue: '#7a5b9e' },
+    { x: 364, y: 700, r: 11, kind: 'books' },
+    { x: 238, y: 348, r: 10, kind: 'mug' }
+  ];
+
+  L.lightAt = function (x, y) {
+    for (const l of this.lights) if (l.contains(x, y)) return true;
+    return false;
+  };
+
+  return L;
+}
+
+/* =============================================================================
+   7. RENDER — everything is drawn procedurally onto the canvas
+   ============================================================================= */
+
+const Draw = {
+
+  /* ---------- floor ---------- */
+  floor(ctx) {
+    const g = ctx.createRadialGradient(270, 540, 40, 270, 540, 640);
+    g.addColorStop(0, '#1b2252');
+    g.addColorStop(0.55, '#131a42');
+    g.addColorStop(1, '#0a0e26');
+    ctx.fillStyle = g;
+    ctx.fillRect(ROOM.x0, ROOM.y0, ROOM.x1 - ROOM.x0, ROOM.y1 - ROOM.y0);
+
+    // floorboards
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(ROOM.x0, ROOM.y0, ROOM.x1 - ROOM.x0, ROOM.y1 - ROOM.y0);
+    ctx.clip();
+    ctx.lineWidth = 1;
+    for (let y = ROOM.y0 + 46; y < ROOM.y1; y += 46) {
+      ctx.strokeStyle = 'rgba(0,0,0,0.22)';
+      ctx.beginPath(); ctx.moveTo(ROOM.x0, y); ctx.lineTo(ROOM.x1, y); ctx.stroke();
+      ctx.strokeStyle = 'rgba(190,215,255,0.045)';
+      ctx.beginPath(); ctx.moveTo(ROOM.x0, y + 1); ctx.lineTo(ROOM.x1, y + 1); ctx.stroke();
+    }
+    ctx.strokeStyle = 'rgba(0,0,0,0.16)';
+    for (let row = 0, y = ROOM.y0; y < ROOM.y1; y += 46, row++) {
+      const off = (row % 2) * 82;
+      for (let x = ROOM.x0 + off; x < ROOM.x1; x += 164) {
+        ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x, y + 46); ctx.stroke();
+      }
+    }
+    ctx.restore();
+  },
+
+  rug(ctx, r) {
+    ctx.save();
+    ctx.globalAlpha = 0.92;
+    const g = ctx.createRadialGradient(r.x, r.y, 6, r.x, r.y, r.rx);
+    g.addColorStop(0, '#3b3470');
+    g.addColorStop(0.55, '#332e63');
+    g.addColorStop(1, '#282450');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.ellipse(r.x, r.y, r.rx, r.ry, 0, 0, TAU); ctx.fill();
+    ctx.lineWidth = 5;
+    ctx.strokeStyle = 'rgba(180,170,255,0.10)';
+    ctx.beginPath(); ctx.ellipse(r.x, r.y, r.rx * 0.72, r.ry * 0.72, 0, 0, TAU); ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,210,160,0.08)';
+    ctx.beginPath(); ctx.ellipse(r.x, r.y, r.rx * 0.45, r.ry * 0.45, 0, 0, TAU); ctx.stroke();
+    ctx.restore();
+  },
+
+  /* ---------- lights ---------- */
+  cone(ctx, z, time) {
+    const R = z.reach;
+    if (R < 10) return;
+    const warm = z.dangerous ? '255,206,120' : '255,236,190';
+    const pulse = z.flicker * (z.dangerous ? 1 + 0.05 * Math.sin(time * 2.3) : 1);
+    const g = ctx.createRadialGradient(z.x, z.y, 6, z.x, z.y, R);
+    g.addColorStop(0,    'rgba(' + warm + ',' + (0.62 * z.fade * pulse) + ')');
+    g.addColorStop(0.45, 'rgba(' + warm + ',' + (0.34 * z.fade * pulse) + ')');
+    g.addColorStop(0.82, 'rgba(' + warm + ',' + (0.17 * z.fade * pulse) + ')');
+    g.addColorStop(0.97, 'rgba(' + warm + ',' + (0.10 * z.fade * pulse) + ')');
+    g.addColorStop(1,    'rgba(' + warm + ',0)');
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.moveTo(z.x, z.y);
+    ctx.arc(z.x, z.y, R, z.dir - z.half, z.dir + z.half);
+    ctx.closePath();
+    ctx.fill();
+
+    // A readable danger boundary: the player must know exactly where it burns.
+    if (z.dangerous) {
+      ctx.strokeStyle = 'rgba(255,180,110,' + (0.34 * z.fade) + ')';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([9, 7]);
+      ctx.lineDashOffset = -Game.time * 14;
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    ctx.restore();
+  },
+
+  /** Light that squeezes through a doorway keeps going as a narrow beam. */
+  shaftBeam(ctx, z, time) {
+    const s = z.shaft;
+    const tip = z.y - z.reach;
+    if (tip > s.wallY0 - 4) return;
+    const y0 = s.wallY0, y1 = Math.max(ROOM.y0, tip);
+    const spread = 16;
+    const a = 0.46 * z.fade * z.flicker;
+    const g = ctx.createLinearGradient(0, y0, 0, y1);
+    g.addColorStop(0, 'rgba(255,206,120,' + a + ')');
+    g.addColorStop(0.7, 'rgba(255,206,120,' + (a * 0.5) + ')');
+    g.addColorStop(1, 'rgba(255,206,120,0)');
+
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.moveTo(s.gx0, y0); ctx.lineTo(s.gx1, y0);
+    ctx.lineTo(s.gx1 + spread, y1); ctx.lineTo(s.gx0 - spread, y1);
+    ctx.closePath(); ctx.fill();
+
+    ctx.strokeStyle = 'rgba(255,180,110,' + (0.32 * z.fade) + ')';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([9, 7]);
+    ctx.lineDashOffset = -time * 14;
+    ctx.beginPath();
+    ctx.moveTo(s.gx0, y0); ctx.lineTo(s.gx0 - spread, y1);
+    ctx.moveTo(s.gx1, y0); ctx.lineTo(s.gx1 + spread, y1);
+    ctx.moveTo(s.gx0 - spread, y1); ctx.lineTo(s.gx1 + spread, y1);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+  },
+
+  lights(ctx, level, time) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(ROOM.x0, ROOM.y0, ROOM.x1 - ROOM.x0, ROOM.y1 - ROOM.y0);
+    ctx.clip();
+    for (const z of level.lights) {
+      if (z.fade < 0.02) continue;
+      if (z.shaft) {
+        // light below the divider wall...
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(ROOM.x0, z.shaft.wallY1, ROOM.x1 - ROOM.x0, ROOM.y1 - z.shaft.wallY1);
+        ctx.clip();
+        this.cone(ctx, z, time);
+        ctx.restore();
+        // ...and the shaft that escapes through the doorway
+        this.shaftBeam(ctx, z, time);
+      } else {
+        this.cone(ctx, z, time);
+      }
+    }
+    ctx.restore();
+  },
+
+  /* ---------- walls ---------- */
+  walls(ctx) {
+    const t = ROOM.y0;
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#2a3168');
+    g.addColorStop(1, '#191e46');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, t);
+    ctx.fillRect(0, ROOM.y1, W, H - ROOM.y1);
+    ctx.fillRect(0, 0, t, H);
+    ctx.fillRect(ROOM.x1, 0, W - ROOM.x1, H);
+
+    // inner rim highlight + soft baseboard shadow inside the room
+    ctx.strokeStyle = 'rgba(160,195,255,0.16)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(ROOM.x0 + 1, ROOM.y0 + 1, ROOM.x1 - ROOM.x0 - 2, ROOM.y1 - ROOM.y0 - 2);
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(ROOM.x0, ROOM.y0, ROOM.x1 - ROOM.x0, ROOM.y1 - ROOM.y0);
+    ctx.clip();
+    const sh = 18;
+    const mk = (x0, y0, x1, y1) => {
+      const lg = ctx.createLinearGradient(x0, y0, x1, y1);
+      lg.addColorStop(0, 'rgba(0,0,0,0.38)');
+      lg.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = lg;
+    };
+    mk(0, ROOM.y0, 0, ROOM.y0 + sh); ctx.fillRect(ROOM.x0, ROOM.y0, ROOM.x1 - ROOM.x0, sh);
+    mk(ROOM.x0, 0, ROOM.x0 + sh, 0); ctx.fillRect(ROOM.x0, ROOM.y0, sh, ROOM.y1 - ROOM.y0);
+    mk(ROOM.x1, 0, ROOM.x1 - sh, 0); ctx.fillRect(ROOM.x1 - sh, ROOM.y0, sh, ROOM.y1 - ROOM.y0);
+    mk(0, ROOM.y1, 0, ROOM.y1 - sh); ctx.fillRect(ROOM.x0, ROOM.y1 - sh, ROOM.x1 - ROOM.x0, sh);
+    ctx.restore();
+
+    // star garland along the top wall
+    for (let i = 0; i < 9; i++) {
+      const x = 40 + i * 58, y = 12 + Math.sin(i * 1.1) * 3;
+      const a = 0.35 + 0.3 * Math.sin(Game.time * 2 + i);
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.fillStyle = 'rgba(255,226,160,' + a + ')';
+      ctx.beginPath(); ctx.arc(x, y, 3.2, 0, TAU); ctx.fill();
+      ctx.globalAlpha = 0.35;
+      ctx.beginPath(); ctx.arc(x, y, 8, 0, TAU); ctx.fill();
+      ctx.restore();
+    }
+  },
+
+  divider(ctx) {
+    const h = DIV.y1 - DIV.y0;
+    const seg = [[ROOM.x0, DIV.gx0], [DIV.gx1, ROOM.x1]];
+    for (const [a, b] of seg) {
+      softShadow(ctx, (a + b) / 2, DIV.y1 + 8, (b - a) / 2, 14, 0.45);
+      const g = ctx.createLinearGradient(0, DIV.y0 - 10, 0, DIV.y1);
+      g.addColorStop(0, '#39417e');
+      g.addColorStop(1, '#1e2453');
+      ctx.fillStyle = g;
+      rr(ctx, a, DIV.y0 - 10, b - a, h + 10, 5); ctx.fill();
+      ctx.fillStyle = 'rgba(170,200,255,0.14)';
+      rr(ctx, a, DIV.y0 - 10, b - a, 4, 2); ctx.fill();
+    }
+    // doorway jambs
+    ctx.fillStyle = 'rgba(255,225,180,0.10)';
+    ctx.fillRect(DIV.gx0 - 3, DIV.y0 - 10, 3, h + 10);
+    ctx.fillRect(DIV.gx1, DIV.y0 - 10, 3, h + 10);
+  },
+
+  /* ---------- generic 2.5D block ---------- */
+  block(ctx, r, lift, top, side, radius) {
+    softShadow(ctx, r.x + r.w / 2, r.y + r.h + 2, r.w * 0.60, 13, 0.42);
+    ctx.fillStyle = side;
+    rr(ctx, r.x, r.y + r.h - lift - radius, r.w, lift + radius, radius); ctx.fill();
+    ctx.fillStyle = top;
+    rr(ctx, r.x, r.y - lift, r.w, r.h, radius); ctx.fill();
+    return { x: r.x, y: r.y - lift, w: r.w, h: r.h };
+  },
+
+  /* ---------- furniture ---------- */
+  furniture(ctx, r) {
+    switch (r.kind) {
+      case 'sofa': {
+        const t = this.block(ctx, r, 14, '#44508f', '#2c3465', 16);
+        ctx.fillStyle = '#36407a';                       // backrest (top edge)
+        rr(ctx, t.x + 4, t.y + 3, t.w - 8, 24, 11); ctx.fill();
+        ctx.fillStyle = '#5766ad';                       // cushions
+        rr(ctx, t.x + 8, t.y + 30, t.w / 2 - 12, t.h - 40, 10); ctx.fill();
+        rr(ctx, t.x + t.w / 2 + 4, t.y + 30, t.w / 2 - 12, t.h - 40, 10); ctx.fill();
+        ctx.fillStyle = 'rgba(255,255,255,0.07)';
+        rr(ctx, t.x + 8, t.y + 30, t.w / 2 - 12, 8, 6); ctx.fill();
+        ctx.fillStyle = '#3a4584';                       // arms
+        rr(ctx, t.x, t.y + 20, 12, t.h - 24, 6); ctx.fill();
+        rr(ctx, t.x + t.w - 12, t.y + 20, 12, t.h - 24, 6); ctx.fill();
+        break;
+      }
+      case 'table': {
+        const t = this.block(ctx, r, 18, '#6b4f57', '#3f2f38', 12);
+        ctx.fillStyle = 'rgba(255,220,180,0.10)';
+        rr(ctx, t.x + 7, t.y + 7, t.w - 14, t.h - 14, 8); ctx.fill();
+        ctx.strokeStyle = 'rgba(0,0,0,0.25)'; ctx.lineWidth = 2;
+        rr(ctx, t.x + 7, t.y + 7, t.w - 14, t.h - 14, 8); ctx.stroke();
+        break;
+      }
+      case 'tv': {
+        const t = this.block(ctx, r, 28, '#2b3162', '#1a1f44', 8);
+        // screen
+        ctx.fillStyle = '#0e1330';
+        rr(ctx, t.x + 10, t.y + 6, t.w - 20, t.h - 14, 6); ctx.fill();
+        ctx.save();
+        ctx.globalCompositeOperation = 'lighter';
+        const sg = ctx.createLinearGradient(0, t.y, 0, t.y + t.h);
+        sg.addColorStop(0, 'rgba(120,170,255,0.20)');
+        sg.addColorStop(1, 'rgba(90,150,255,0.05)');
+        ctx.fillStyle = sg;
+        rr(ctx, t.x + 10, t.y + 6, t.w - 20, t.h - 14, 6); ctx.fill();
+        const bloom = ctx.createRadialGradient(t.x + t.w / 2, t.y + t.h / 2, 4, t.x + t.w / 2, t.y + t.h / 2, t.w * 0.6);
+        bloom.addColorStop(0, 'rgba(110,170,255,0.16)');
+        bloom.addColorStop(1, 'rgba(110,170,255,0)');
+        ctx.fillStyle = bloom;
+        ctx.fillRect(t.x - 30, t.y - 20, t.w + 60, t.h + 40);
+        ctx.restore();
+        ctx.strokeStyle = 'rgba(170,200,255,0.18)'; ctx.lineWidth = 2;
+        rr(ctx, t.x + 10, t.y + 6, t.w - 20, t.h - 14, 6); ctx.stroke();
+        break;
+      }
+      case 'bed': {
+        const t = this.block(ctx, r, 16, '#4a3f78', '#2b2450', 14);
+        ctx.fillStyle = '#8e93cf';                                   // mattress
+        rr(ctx, t.x + 7, t.y + 34, t.w - 14, t.h - 44, 12); ctx.fill();
+        ctx.fillStyle = '#6f6bb8';                                   // blanket
+        rr(ctx, t.x + 7, t.y + t.h * 0.46, t.w - 14, t.h * 0.46, 12); ctx.fill();
+        ctx.fillStyle = 'rgba(255,255,255,0.10)';
+        rr(ctx, t.x + 7, t.y + t.h * 0.46, t.w - 14, 7, 4); ctx.fill();
+        ctx.fillStyle = '#dfe4ff';                                   // pillow
+        rr(ctx, t.x + 22, t.y + 10, t.w - 44, 30, 12); ctx.fill();
+        ctx.fillStyle = 'rgba(120,120,190,0.35)';
+        rr(ctx, t.x + 22, t.y + 30, t.w - 44, 8, 6); ctx.fill();
+        break;
+      }
+      case 'dresser': {
+        const t = this.block(ctx, r, 24, '#4d3f5c', '#2c2439', 10);
+        ctx.fillStyle = 'rgba(0,0,0,0.28)';
+        for (let i = 0; i < 3; i++) { rr(ctx, t.x + 9, t.y + 10 + i * 28, t.w - 18, 20, 6); ctx.fill(); }
+        ctx.fillStyle = 'rgba(255,214,150,0.5)';
+        for (let i = 0; i < 3; i++) { ctx.beginPath(); ctx.arc(t.x + t.w / 2, t.y + 20 + i * 28, 3, 0, TAU); ctx.fill(); }
+        break;
+      }
+      case 'nightstand': {
+        const t = this.block(ctx, r, 18, '#4d3f5c', '#2c2439', 9);
+        ctx.fillStyle = 'rgba(0,0,0,0.28)';
+        rr(ctx, t.x + 8, t.y + 12, t.w - 16, 16, 5); ctx.fill();
+        ctx.fillStyle = 'rgba(255,214,150,0.5)';
+        ctx.beginPath(); ctx.arc(t.x + t.w / 2, t.y + 20, 3, 0, TAU); ctx.fill();
+        break;
+      }
+    }
+  },
+
+  plant(ctx, c, time) {
+    softShadow(ctx, c.x, c.y + c.r * 0.7, c.r * 1.1, c.r * 0.5, 0.42);
+    ctx.fillStyle = '#7a4a44';                                      // pot
+    rr(ctx, c.x - c.r * 0.7, c.y - 2, c.r * 1.4, c.r * 0.95, 5); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.08)';
+    rr(ctx, c.x - c.r * 0.7, c.y - 2, c.r * 1.4, 5, 3); ctx.fill();
+    const sway = Math.sin(time * 1.3 + c.seed) * 0.09;              // leaves
+    for (let i = 0; i < 5; i++) {
+      const a = -Math.PI / 2 + (i - 2) * 0.52 + sway;
+      const len = c.r * (1.25 + (i % 2) * 0.35);
+      ctx.save();
+      ctx.translate(c.x, c.y - 2);
+      ctx.rotate(a);
+      const g = ctx.createLinearGradient(0, 0, 0, -len);
+      g.addColorStop(0, '#2f6b52'); g.addColorStop(1, '#49a179');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.ellipse(0, -len * 0.55, c.r * 0.26, len * 0.55, 0, 0, TAU); ctx.fill();
+      ctx.restore();
+    }
+  },
+
+  decor(ctx, d) {
+    switch (d.kind) {
+      case 'cushion':
+        softShadow(ctx, d.x, d.y + 6, d.r * 1.2, d.r * 0.5, 0.35);
+        ctx.fillStyle = d.hue;
+        rr(ctx, d.x - d.r, d.y - d.r * 0.75, d.r * 2, d.r * 1.5, d.r * 0.6); ctx.fill();
+        ctx.fillStyle = 'rgba(255,255,255,0.12)';
+        rr(ctx, d.x - d.r + 3, d.y - d.r * 0.75 + 3, d.r * 2 - 6, 5, 3); ctx.fill();
+        break;
+      case 'books':
+        softShadow(ctx, d.x, d.y + 6, 16, 7, 0.3);
+        ['#c4585e', '#5b86c9', '#d8a24a'].forEach((c, i) => {
+          ctx.fillStyle = c;
+          rr(ctx, d.x - 15, d.y - i * 6, 30, 5, 2); ctx.fill();
+        });
+        break;
+      case 'mug':
+        softShadow(ctx, d.x, d.y + 4, 9, 4, 0.3);
+        ctx.fillStyle = '#e7eefc';
+        rr(ctx, d.x - 6, d.y - 8, 12, 12, 4); ctx.fill();
+        ctx.strokeStyle = '#e7eefc'; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(d.x + 8, d.y - 2, 4, -1, 1.4); ctx.stroke();
+        ctx.save();
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.fillStyle = 'rgba(200,225,255,0.25)';
+        ctx.beginPath(); ctx.ellipse(d.x, d.y - 14 - Math.sin(Game.time * 2) * 2, 5, 8, 0, 0, TAU); ctx.fill();
+        ctx.restore();
+        break;
+    }
+  },
+
+  /* ---------- possessables ---------- */
+  highlightRing(ctx, o, time) {
+    const a = Math.max(o.highlight * 0.9, o.glow);
+    if (a < 0.02) return;
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    const pr = o.r + 12 + Math.sin(time * 3.4) * 3;
+    ctx.strokeStyle = 'rgba(140,215,255,' + (0.55 * a) + ')';
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.ellipse(o.x, o.y, pr, pr * 0.62, 0, 0, TAU); ctx.stroke();
+    const g = ctx.createRadialGradient(o.x, o.y, 2, o.x, o.y, pr * 1.8);
+    g.addColorStop(0, 'rgba(120,200,255,' + (0.30 * a) + ')');
+    g.addColorStop(1, 'rgba(120,200,255,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.ellipse(o.x, o.y, pr * 1.8, pr * 1.2, 0, 0, TAU); ctx.fill();
+    ctx.restore();
+  },
+
+  lamp(ctx, lamp, time) {
+    const bob = lamp.sway * Math.sin(time * 22) * 3;
+    const pop = 1 + lamp.pop * 0.12;
+    this.highlightRing(ctx, lamp, time);
+    softShadow(ctx, lamp.x, lamp.y + 6, 26, 11, 0.5);
+
+    ctx.save();
+    ctx.translate(lamp.x + bob, lamp.y);
+    ctx.scale(pop, pop);
+
+    ctx.fillStyle = '#3b4380';                                   // base
+    ctx.beginPath(); ctx.ellipse(0, 0, 22, 9, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = 'rgba(190,215,255,0.16)';
+    ctx.beginPath(); ctx.ellipse(0, -2, 22, 8, 0, 0, TAU); ctx.fill();
+
+    ctx.strokeStyle = '#5a639f'; ctx.lineWidth = 6;              // pole
+    ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(0, -2); ctx.lineTo(0, -66); ctx.stroke();
+
+    const on = lamp.light.fade;
+    ctx.beginPath();                                             // shade
+    ctx.moveTo(-16, -66); ctx.lineTo(16, -66);
+    ctx.lineTo(27, -100); ctx.lineTo(-27, -100); ctx.closePath();
+    const sg = ctx.createLinearGradient(0, -100, 0, -66);
+    sg.addColorStop(0, on > 0.5 ? '#ffe4a8' : '#5b6098');
+    sg.addColorStop(1, on > 0.5 ? '#ffb95e' : '#454a80');
+    ctx.fillStyle = sg; ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.18)'; ctx.lineWidth = 2; ctx.stroke();
+
+    if (on > 0.05) {                                             // bulb bloom
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      const g = ctx.createRadialGradient(0, -68, 2, 0, -68, 56);
+      g.addColorStop(0, 'rgba(255,231,170,' + (0.75 * on) + ')');
+      g.addColorStop(1, 'rgba(255,200,120,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(0, -68, 56, 0, TAU); ctx.fill();
+      ctx.restore();
+    }
+    ctx.restore();
+
+    if (lamp.glow > 0.02) this.possessAura(ctx, lamp.x, lamp.y - 50, 46, lamp.glow, time);
+  },
+
+  nightLamp(ctx, c, light, time) {
+    softShadow(ctx, c.x, c.y + 4, 18, 8, 0.45);
+    ctx.fillStyle = '#3b4380';
+    ctx.beginPath(); ctx.ellipse(c.x, c.y, 15, 7, 0, 0, TAU); ctx.fill();
+    ctx.strokeStyle = '#5a639f'; ctx.lineWidth = 5; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(c.x, c.y - 2); ctx.lineTo(c.x, c.y - 40); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(c.x - 12, c.y - 40); ctx.lineTo(c.x + 12, c.y - 40);
+    ctx.lineTo(c.x + 19, c.y - 66); ctx.lineTo(c.x - 19, c.y - 66); ctx.closePath();
+    const sg = ctx.createLinearGradient(0, c.y - 66, 0, c.y - 40);
+    sg.addColorStop(0, '#ffe0a0'); sg.addColorStop(1, '#ffb95e');
+    ctx.fillStyle = sg; ctx.fill();
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    const g = ctx.createRadialGradient(c.x, c.y - 44, 2, c.x, c.y - 44, 44);
+    g.addColorStop(0, 'rgba(255,231,170,' + (0.6 * light.fade) + ')');
+    g.addColorStop(1, 'rgba(255,200,120,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(c.x, c.y - 44, 44, 0, TAU); ctx.fill();
+    ctx.restore();
+  },
+
+  fan(ctx, fan, time) {
+    this.highlightRing(ctx, fan, time);
+    softShadow(ctx, fan.x, fan.y + 6, 24, 10, 0.45);
+    const pop = 1 + fan.pop * 0.12;
+    ctx.save();
+    ctx.translate(fan.x, fan.y);
+    ctx.scale(pop, pop);
+
+    ctx.fillStyle = '#3b4380';
+    ctx.beginPath(); ctx.ellipse(0, 0, 20, 8, 0, 0, TAU); ctx.fill();
+    ctx.strokeStyle = '#5a639f'; ctx.lineWidth = 5; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(0, -2); ctx.lineTo(0, -26); ctx.stroke();
+
+    ctx.save();                                   // cage + blades
+    ctx.translate(0, -44);
+    ctx.fillStyle = 'rgba(20,26,60,0.75)';
+    ctx.beginPath(); ctx.arc(0, 0, 25, 0, TAU); ctx.fill();
+    ctx.save();
+    ctx.rotate(fan.spin);
+    for (let i = 0; i < 3; i++) {
+      ctx.rotate(TAU / 3);
+      const g = ctx.createLinearGradient(0, 0, 20, 0);
+      g.addColorStop(0, '#9fb4ee'); g.addColorStop(1, '#6a7fc4');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.ellipse(11, 0, 12, 6, 0.4, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+    ctx.fillStyle = '#cfe0ff';
+    ctx.beginPath(); ctx.arc(0, 0, 5, 0, TAU); ctx.fill();
+    ctx.strokeStyle = 'rgba(190,215,255,0.35)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(0, 0, 25, 0, TAU); ctx.stroke();
+    ctx.strokeStyle = 'rgba(190,215,255,0.18)'; ctx.lineWidth = 1;
+    for (let i = 1; i <= 2; i++) { ctx.beginPath(); ctx.arc(0, 0, 25 * i / 3, 0, TAU); ctx.stroke(); }
+    ctx.restore();
+    ctx.restore();
+
+    if (fan.glow > 0.02) this.possessAura(ctx, fan.x, fan.y - 30, 40, fan.glow, time);
+  },
+
+  car(ctx, car, time) {
+    this.highlightRing(ctx, car, time);
+    softShadow(ctx, car.x, car.y + 8, 20, 9, 0.45);
+    const pop = 1 + car.pop * 0.15 + car.bump * 0.06;
+    ctx.save();
+    ctx.translate(car.x, car.y - 3);
+    ctx.rotate(car.angle + Math.PI / 2);
+    ctx.scale(pop, pop);
+
+    ctx.fillStyle = '#1a1f40';                                  // wheels
+    for (const [wx, wy] of [[-13, -8], [13, -8], [-13, 9], [13, 9]]) {
+      ctx.save(); ctx.translate(wx, wy);
+      rr(ctx, -4, -7, 8, 14, 3); ctx.fill();
+      ctx.fillStyle = 'rgba(200,220,255,0.35)';
+      ctx.beginPath(); ctx.arc(0, Math.sin(car.wheel + wx) * 3, 2, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#1a1f40';
+      ctx.restore();
+    }
+    const bg = ctx.createLinearGradient(0, -22, 0, 22);          // body
+    bg.addColorStop(0, '#ff9a7a'); bg.addColorStop(1, '#e4564f');
+    ctx.fillStyle = bg;
+    rr(ctx, -15, -22, 30, 44, 9); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.18)';
+    rr(ctx, -12, -19, 9, 34, 5); ctx.fill();
+    ctx.fillStyle = '#bfe6ff';                                   // windshield
+    rr(ctx, -11, -15, 22, 13, 5); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    rr(ctx, -11, -15, 22, 5, 3); ctx.fill();
+    ctx.fillStyle = '#ffe9b0';                                   // headlights
+    ctx.beginPath(); ctx.arc(-9, -21, 3, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.arc(9, -21, 3, 0, TAU); ctx.fill();
+    if (car.possessed) {
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      const g = ctx.createLinearGradient(0, -24, 0, -80);
+      g.addColorStop(0, 'rgba(255,235,170,0.35)');
+      g.addColorStop(1, 'rgba(255,235,170,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.moveTo(-11, -22); ctx.lineTo(11, -22);
+      ctx.lineTo(30, -78); ctx.lineTo(-30, -78); ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+    ctx.restore();
+
+    if (car.glow > 0.02) this.possessAura(ctx, car.x, car.y, 34, car.glow, time);
+  },
+
+  possessAura(ctx, x, y, r, a, time) {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    const pr = r * (1 + 0.06 * Math.sin(time * 5));
+    const g = ctx.createRadialGradient(x, y, 2, x, y, pr);
+    g.addColorStop(0, 'rgba(150,225,255,' + (0.42 * a) + ')');
+    g.addColorStop(0.55, 'rgba(90,170,255,' + (0.2 * a) + ')');
+    g.addColorStop(1, 'rgba(90,170,255,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(x, y, pr, 0, TAU); ctx.fill();
+    ctx.strokeStyle = 'rgba(190,240,255,' + (0.35 * a) + ')';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(x, y, pr * 0.62, time * 2, time * 2 + 2.2); ctx.stroke();
+    ctx.restore();
+  },
+
+  /* ---------- puzzle props ---------- */
+  plate(ctx, p, time) {
+    const press = p.press;
+    softShadow(ctx, p.x, p.y + 4, p.r * 1.1, p.r * 0.5, 0.4);
+    ctx.fillStyle = '#232a58';
+    ctx.beginPath(); ctx.ellipse(p.x, p.y, p.r, p.r * 0.52, 0, 0, TAU); ctx.fill();
+
+    const lift = 6 * (1 - press);
+    const col = p.pressed ? '#5ee6a4' : '#8ea0e8';
+    ctx.fillStyle = p.pressed ? '#2e6d55' : '#39427e';
+    ctx.beginPath(); ctx.ellipse(p.x, p.y - lift, p.r * 0.82, p.r * 0.43, 0, 0, TAU); ctx.fill();
+
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.strokeStyle = col;
+    ctx.globalAlpha = 0.55 + 0.35 * Math.sin(time * 3 + (p.pressed ? 0 : 1));
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.ellipse(p.x, p.y - lift, p.r * 0.6, p.r * 0.31, 0, 0, TAU); ctx.stroke();
+    // ripple while idle so the player notices it
+    const rp = (p.ring % 1);
+    ctx.globalAlpha = (1 - rp) * (p.pressed ? 0.25 : 0.4);
+    ctx.beginPath();
+    ctx.ellipse(p.x, p.y - lift, p.r * (0.5 + rp * 0.75), p.r * (0.26 + rp * 0.39), 0, 0, TAU);
+    ctx.stroke();
+    ctx.restore();
+
+    // little arrows pointing in
+    ctx.save();
+    ctx.globalAlpha = 0.5;
+    ctx.fillStyle = col;
+    for (let i = 0; i < 4; i++) {
+      const a = i * Math.PI / 2 + Math.PI / 4;
+      const d = p.r * 0.95 + (p.pressed ? 0 : Math.sin(time * 3) * 2);
+      ctx.save();
+      ctx.translate(p.x + Math.cos(a) * d, p.y + Math.sin(a) * d * 0.52);
+      ctx.rotate(a + Math.PI / 2);
+      ctx.beginPath(); ctx.moveTo(0, -4); ctx.lineTo(4, 3); ctx.lineTo(-4, 3); ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+    ctx.restore();
+  },
+
+  door(ctx, d, time) {
+    const cx = (d.x0 + d.x1) / 2;
+    const w = d.x1 - d.x0;
+    const shk = d.shake ? Math.sin(time * 55) * d.shake * 3 : 0;
+    const open = d.open;
+
+    ctx.save();
+    ctx.translate(shk, 0);
+
+    // recessed frame
+    ctx.fillStyle = '#10142f';
+    rr(ctx, d.x0 - 9, -14, w + 18, 76, 12); ctx.fill();
+    ctx.strokeStyle = 'rgba(170,200,255,0.22)'; ctx.lineWidth = 3;
+    rr(ctx, d.x0 - 9, -14, w + 18, 76, 12); ctx.stroke();
+
+    // the corridor beyond, warm when unlocked
+    const back = ctx.createLinearGradient(0, -10, 0, 58);
+    back.addColorStop(0, open > 0.05 ? 'rgba(255,232,176,' + (0.85 * open) + ')' : 'rgba(22,28,64,1)');
+    back.addColorStop(1, open > 0.05 ? 'rgba(255,196,110,' + (0.45 * open) + ')' : 'rgba(16,20,48,1)');
+    ctx.fillStyle = '#161c40';
+    rr(ctx, d.x0, -10, w, 66, 8); ctx.fill();
+    ctx.fillStyle = back;
+    rr(ctx, d.x0, -10, w, 66, 8); ctx.fill();
+
+    // door slab: swings to the left as it opens
+    ctx.save();
+    ctx.translate(d.x0 + 3, 54);
+    ctx.rotate(-open * 1.15);
+    const slab = ctx.createLinearGradient(0, -66, w, 0);
+    slab.addColorStop(0, '#4b3f6e');
+    slab.addColorStop(1, '#392f57');
+    ctx.fillStyle = slab;
+    rr(ctx, 0, -64, w - 6, 64, 7); ctx.fill();
+    ctx.strokeStyle = 'rgba(200,215,255,0.20)'; ctx.lineWidth = 2;
+    rr(ctx, 6, -56, w - 18, 46, 5); ctx.stroke();
+    ctx.fillStyle = '#ffd98a';
+    ctx.beginPath(); ctx.arc(w - 16, -30, 3.4, 0, TAU); ctx.fill();   // knob
+    ctx.restore();
+
+    // light spilling into the room
+    if (open > 0.03) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(ROOM.x0, ROOM.y0, ROOM.x1 - ROOM.x0, ROOM.y1 - ROOM.y0);
+      ctx.clip();
+      ctx.globalCompositeOperation = 'lighter';
+      const g2 = ctx.createLinearGradient(0, 24, 0, 24 + 150 * open);
+      g2.addColorStop(0, 'rgba(255,226,160,' + (0.34 * open) + ')');
+      g2.addColorStop(1, 'rgba(255,200,120,0)');
+      ctx.fillStyle = g2;
+      ctx.beginPath();
+      ctx.moveTo(d.x0, 24); ctx.lineTo(d.x1, 24);
+      ctx.lineTo(d.x1 + 52 * open, 24 + 150 * open);
+      ctx.lineTo(d.x0 - 52 * open, 24 + 150 * open);
+      ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+
+    // lock indicator
+    const lockA = 1 - open;
+    if (lockA > 0.02) {
+      ctx.save();
+      ctx.globalAlpha = lockA;
+      ctx.translate(cx, 76);
+      ctx.fillStyle = 'rgba(10,14,36,0.8)';
+      ctx.beginPath(); ctx.arc(0, 0, 14, 0, TAU); ctx.fill();
+      ctx.strokeStyle = '#9fb2f0'; ctx.lineWidth = 2.4;
+      ctx.beginPath(); ctx.arc(0, -3, 5, Math.PI, 0); ctx.stroke();   // shackle
+      ctx.fillStyle = '#c6d6ff';
+      rr(ctx, -6.5, -3, 13, 11, 2.5); ctx.fill();
+      ctx.fillStyle = '#2b3160';
+      ctx.beginPath(); ctx.arc(0, 2.5, 1.8, 0, TAU); ctx.fill();
+      ctx.restore();
+    } else {
+      // exit arrow once it is open
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = 0.55 + 0.35 * Math.sin(time * 4);
+      ctx.fillStyle = '#c8ffd9';
+      ctx.translate(cx, 84 + Math.sin(time * 3) * 4);
+      ctx.beginPath(); ctx.moveTo(0, -9); ctx.lineTo(9, 4); ctx.lineTo(-9, 4); ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+    ctx.restore();
+  },
+
+  ghost(ctx, g, time) {
+    if (g.hidden) return;
+    const dangerT = g.danger / DANGER_TIME;
+    const bob = Math.sin(time * 2.4) * 4;
+    const sq = g.squash;
+    const shake = dangerT > 0 ? Math.sin(time * 42) * dangerT * 2.4 : 0;
+    const x = g.x + shake, y = g.y + bob;
+    const r = g.r * 1.6;
+
+    // glow
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    const gl = ctx.createRadialGradient(x, y, 3, x, y, 70);
+    const c = dangerT > 0.05
+      ? 'rgba(255,' + Math.floor(200 - 90 * dangerT) + ',150,'
+      : 'rgba(150,215,255,';
+    gl.addColorStop(0, c + (0.34 + 0.06 * Math.sin(time * 3)) + ')');
+    gl.addColorStop(1, c + '0)');
+    ctx.fillStyle = gl;
+    ctx.beginPath(); ctx.arc(x, y, 70, 0, TAU); ctx.fill();
+    ctx.restore();
+
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(1 + sq * 0.18, 1 - sq * 0.18);
+
+    // body
+    ctx.beginPath();
+    ctx.arc(0, 0, r, Math.PI, 0);
+    const bottom = r * 1.05;
+    ctx.lineTo(r, bottom - 4);
+    const humps = 4;
+    for (let i = 0; i < humps; i++) {
+      const x0 = r - (2 * r) * (i / humps);
+      const x1 = r - (2 * r) * ((i + 1) / humps);
+      const mid = (x0 + x1) / 2;
+      const dip = (i % 2 === 0 ? 1 : -1) * 7 + Math.sin(time * 4 + i * 1.7) * 3;
+      ctx.quadraticCurveTo(mid, bottom + dip, x1, bottom - 4);
+    }
+    ctx.closePath();
+
+    const bg = ctx.createLinearGradient(0, -r, 0, bottom);
+    if (dangerT > 0.05) {
+      bg.addColorStop(0, '#fff2e4');
+      bg.addColorStop(1, 'rgb(' + Math.floor(255) + ',' + Math.floor(210 - 70 * dangerT) + ',' + Math.floor(190 - 110 * dangerT) + ')');
+    } else {
+      bg.addColorStop(0, '#ffffff');
+      bg.addColorStop(1, '#cfe8ff');
+    }
+    ctx.fillStyle = bg;
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(160,220,255,0.55)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // face (authored for a 20px body, scaled to whatever the ghost size is)
+    ctx.save();
+    ctx.scale(r / 20, r / 20);
+    const look = g.face * 3;
+    const eyeY = -2;
+    ctx.fillStyle = '#22285a';
+    if (g.blinkT > 0) {
+      ctx.lineWidth = 2.4; ctx.strokeStyle = '#22285a';
+      ctx.beginPath(); ctx.moveTo(-8 + look, eyeY); ctx.lineTo(-3 + look, eyeY); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(3 + look, eyeY); ctx.lineTo(8 + look, eyeY); ctx.stroke();
+    } else {
+      ctx.beginPath(); ctx.ellipse(-5.5 + look, eyeY, 2.6, 3.6, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(5.5 + look, eyeY, 2.6, 3.6, 0, 0, TAU); ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.9)';
+      ctx.beginPath(); ctx.arc(-6.4 + look, eyeY - 1.4, 1, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(4.6 + look, eyeY - 1.4, 1, 0, TAU); ctx.fill();
+    }
+    // blush
+    ctx.fillStyle = 'rgba(255,150,170,0.38)';
+    ctx.beginPath(); ctx.ellipse(-11 + look * 0.6, eyeY + 5, 3.6, 2.4, 0, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(11 + look * 0.6, eyeY + 5, 3.6, 2.4, 0, 0, TAU); ctx.fill();
+    // mouth
+    ctx.strokeStyle = '#22285a'; ctx.lineWidth = 1.6; ctx.lineCap = 'round';
+    ctx.beginPath();
+    if (dangerT > 0.25) ctx.arc(look * 0.5, eyeY + 11, 3, Math.PI, 0);        // worried
+    else ctx.arc(look * 0.5, eyeY + 7, 3, 0.15, Math.PI - 0.15);
+    ctx.stroke();
+    ctx.restore();
+
+    ctx.restore();
+  },
+
+  /* ---------- screen effects ---------- */
+  vignette(ctx, dangerT) {
+    const g = ctx.createRadialGradient(W / 2, H / 2, H * 0.28, W / 2, H / 2, H * 0.72);
+    g.addColorStop(0, 'rgba(0,0,0,0)');
+    g.addColorStop(1, 'rgba(2,4,14,0.62)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    if (dangerT > 0.01) {
+      const dg = ctx.createRadialGradient(W / 2, H / 2, H * 0.18, W / 2, H / 2, H * 0.62);
+      dg.addColorStop(0, 'rgba(255,90,70,0)');
+      dg.addColorStop(1, 'rgba(255,90,70,' + (0.46 * dangerT) + ')');
+      ctx.fillStyle = dg;
+      ctx.fillRect(0, 0, W, H);
+    }
+  },
+
+  dangerMeter(ctx, g) {
+    const t = g.danger / DANGER_TIME;
+    if (t <= 0.01 || g.hidden) return;
+    const x = g.x, y = g.y - 42, w = 44;
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    rr(ctx, x - w / 2, y, w, 6, 3); ctx.fill();
+    const col = t > 0.66 ? '#ff6b5c' : t > 0.33 ? '#ffb45c' : '#ffe08a';
+    ctx.fillStyle = col;
+    rr(ctx, x - w / 2, y, w * t, 6, 3); ctx.fill();
+    ctx.restore();
+  }
+};
+
+/* =============================================================================
+   8. GAME — state machine, main loop and UI glue
+   ============================================================================= */
+
+const UI = {
+  frame:    document.getElementById('frame'),
+  canvas:   document.getElementById('game'),
+  toast:    document.getElementById('toast'),
+  objective:document.getElementById('objective'),
+  btnAction:document.getElementById('btn-action'),
+  btnRelease:document.getElementById('btn-release'),
+  btnRestart:document.getElementById('btn-restart'),
+  overlay:  document.getElementById('overlay'),
+  ovTitle:  document.getElementById('ov-title'),
+  ovText:   document.getElementById('ov-text'),
+  btnNext:  document.getElementById('btn-next'),
+  btnAgain: document.getElementById('btn-again'),
+  intro:    document.getElementById('intro'),
+  btnStart: document.getElementById('btn-start'),
+  flash:    document.getElementById('flash'),
+  joy:      document.getElementById('joystick'),
+  knob:     document.getElementById('joy-knob')
+};
+
+const Game = {
+  state: 'intro',            // intro | play | dying | win
+  time: 0,
+  level: null,
+  ghost: null,
+  possessed: null,
+  target: null,
+  shake: 0,
+  timer: 0,
+  hints: {},
+  toastT: 0,
+  winT: 0,
+  lastLabel: '', lastWarm: false, lastShowAction: false, lastShowRelease: false,
+
+  /* ---------------- setup ---------------- */
+  init() {
+    this.ctx = UI.canvas.getContext('2d');
+    this.resize();
+    addEventListener('resize', () => this.resize());
+    addEventListener('orientationchange', () => setTimeout(() => this.resize(), 250));
+
+    Input.init(UI.frame, UI.joy, UI.knob);
+    this.bindUI();
+    this.reset();
+
+    let last = performance.now();
+    const loop = now => {
+      const dt = Math.min(0.034, (now - last) / 1000);
+      last = now;
+      this.update(dt);
+      this.draw();
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  },
+
+  resize() {
+    const r = UI.frame.getBoundingClientRect();
+    const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+    UI.canvas.width  = Math.max(1, Math.round(r.width * dpr));
+    UI.canvas.height = Math.max(1, Math.round(r.height * dpr));
+    this.sx = (r.width * dpr) / W;
+    this.sy = (r.height * dpr) / H;
+    Input.park();
+  },
+
+  bindUI() {
+    const tap = (el, fn) => {
+      el.addEventListener('pointerdown', e => {
+        e.preventDefault(); e.stopPropagation();
+        SFX.init();
+        fn();
+      }, { passive: false });
+    };
+    tap(UI.btnAction,  () => this.doAction());
+    tap(UI.btnRelease, () => this.doRelease());
+    tap(UI.btnRestart, () => { this.hideOverlay(); this.reset(); this.toast('Level restarted'); });
+    tap(UI.btnAgain,   () => { this.hideOverlay(); this.reset(); });
+    tap(UI.btnNext,    () => {
+      this.hideOverlay(); this.reset();
+      this.toast('More levels coming soon! Here is level 1 again.', 3.2);
+    });
+    tap(UI.btnStart,   () => {
+      UI.intro.classList.add('hidden');
+      this.state = 'play';
+      this.toast('Stay in the dark. Warm light burns!', 3.2);
+    });
+  },
+
+  /* ---------------- level lifecycle ---------------- */
+  reset() {
+    this.level = buildLevel();
+    this.ghost = new Ghost(262, 826);
+    this.possessed = null;
+    this.target = null;
+    this.hints = {};
+    this.shake = 0;
+    this.winT = 0;
+    Particles.clear();
+    UI.objective.textContent = 'Reach the exit';
+    UI.objective.classList.remove('done');
+    if (this.state !== 'intro') this.state = 'play';
+  },
+
+  toast(msg, dur) {
+    UI.toast.textContent = msg;
+    UI.toast.classList.add('show');
+    this.toastT = dur || 2.4;
+  },
+  hint(id, msg, dur) {
+    if (this.hints[id]) return;
+    this.hints[id] = true;
+    this.toast(msg, dur);
+  },
+  hideOverlay() { UI.overlay.classList.add('hidden'); },
+
+  /* ---------------- possession ---------------- */
+  findTarget() {
+    if (this.possessed || this.ghost.hidden) return null;
+    let best = null, bd = POSSESS_DIST;
+    for (const p of this.level.possessables) {
+      const d = dist(this.ghost.x, this.ghost.y, p.x, p.y);
+      if (d < bd) { bd = d; best = p; }
+    }
+    return best;
+  },
+
+  possess(p) {
+    this.possessed = p;
+    p.possessed = true;
+    p.onPossess();
+    this.ghost.hidden = true;
+    this.ghost.danger = 0;
+    this.ghost.vx = this.ghost.vy = 0;
+    SFX.possess();
+    Particles.burst(this.ghost.x, this.ghost.y, 24, {
+      colors: ['#bff0ff', '#7fd4ff', '#ffffff'], spdMax: 190
+    });
+    Particles.spawn({ x: p.x, y: p.y, vx: 0, vy: 0, life: 0.55, size: 14, color: '#9fe4ff', shape: 'ring' });
+    for (let i = 0; i < 10; i++) {
+      Particles.spawn({
+        x: p.x + rand(-28, 28), y: p.y + rand(-30, 10),
+        vx: rand(-25, 25), vy: rand(-90, -30),
+        life: rand(0.4, 0.9), size: rand(2, 5), color: '#cdefff', shape: 'star', spin: rand(-6, 6)
+      });
+    }
+    this.shake = 0.25;
+    if (p.name === 'lamp')      this.hint('h-lamp-in', 'Now press TURN OFF to kill the light');
+    else if (p.name === 'car')  this.hint('h-car-in', 'Drive onto the glowing plate');
+    else if (p.name === 'fan')  this.hint('h-fan-in', 'Spin it up! (not needed to escape)');
+  },
+
+  doRelease() {
+    const p = this.possessed;
+    if (!p) return;
+    p.possessed = false;
+    p.onRelease();
+    this.possessed = null;
+
+    const g = this.ghost;
+    g.x = p.x + (p.name === 'car' ? -Math.cos(p.angle) * 26 : 0);
+    g.y = p.y + (p.name === 'car' ? 30 : 46);
+    g.x = clamp(g.x, ROOM.x0 + g.r, ROOM.x1 - g.r);
+    g.y = clamp(g.y, ROOM.y0 + g.r, ROOM.y1 - g.r);
+    g.vx = g.vy = 0;
+    g.hidden = false;
+    Collide.resolve(g, this.level);
+    SFX.release();
+    Particles.burst(g.x, g.y, 20, { colors: ['#dff4ff', '#8fd8ff'], spdMax: 170 });
+    Particles.spawn({ x: g.x, y: g.y, vx: 0, vy: 0, life: 0.5, size: 12, color: '#bfe9ff', shape: 'ring' });
+    this.shake = 0.18;
+  },
+
+  /** The big contextual button. */
+  doAction() {
+    if (this.state !== 'play') return;
+    const p = this.possessed;
+    if (p) {
+      if (p.actionLabel()) p.activate();     // lamp / fan toggle
+      else this.doRelease();                 // car: the big button is RELEASE
+      return;
+    }
+    const t = this.findTarget();
+    if (t) this.possess(t);
+  },
+
+  /* ---------------- failure / victory ---------------- */
+  fail() {
+    if (this.state !== 'play') return;
+    this.state = 'dying';
+    this.timer = 0.75;
+    this.shake = 0.5;
+    SFX.fail();
+    const g = this.ghost;
+    Particles.burst(g.x, g.y, 32, { colors: ['#ffd2a8', '#ffffff', '#ffb38a'], spdMax: 220, grav: -40 });
+    UI.flash.classList.add('on');
+  },
+
+  win() {
+    if (this.state !== 'play') return;
+    this.state = 'win';
+    this.winT = 0;
+    this.ghost.hidden = true;
+    SFX.win();
+    const cx = (DOOR.x0 + DOOR.x1) / 2;
+    for (let i = 0; i < 60; i++) {
+      Particles.spawn({
+        x: cx + rand(-30, 30), y: 70 + rand(-20, 20),
+        vx: rand(-170, 170), vy: rand(-40, 210),
+        life: rand(0.7, 1.6), size: rand(2.5, 6),
+        color: pick(['#fff2c8', '#9dffc8', '#a9e2ff', '#ffb8d8', '#ffd88a']),
+        shape: Math.random() < 0.4 ? 'star' : 'dot',
+        spin: rand(-8, 8), grav: 120, drag: 0.96
+      });
+    }
+    UI.objective.textContent = 'Escaped!';
+    UI.objective.classList.add('done');
+  },
+
+  /* ---------------- per-frame update ---------------- */
+  update(dt) {
+    this.time += dt;
+    this.shake = Math.max(0, this.shake - dt * 1.6);
+
+    if (this.toastT > 0) {
+      this.toastT -= dt;
+      if (this.toastT <= 0) UI.toast.classList.remove('show');
+    }
+
+    const L = this.level;
+    if (!L) return;
+
+    // keyboard edges
+    if (Input.takeAction()) this.doAction();
+    if (Input.takeRelease()) this.doRelease();
+
+    const input = (this.state === 'play') ? Input.vector() : { x: 0, y: 0, mag: 0 };
+
+    if (this.state === 'play') {
+      // ghost or possessed object
+      if (this.possessed === L.car) {
+        L.car.update(dt, input, L);
+        this.ghost.x = L.car.x; this.ghost.y = L.car.y;
+      } else {
+        this.ghost.update(dt, input, L);
+        L.car.update(dt, { x: 0, y: 0, mag: 0 }, L);
+      }
+      if (this.possessed && this.possessed !== L.car) {
+        this.ghost.x = this.possessed.x; this.ghost.y = this.possessed.y;
+      }
+    }
+
+    L.lamp.update(dt);
+    L.fan.update(dt);
+    for (const l of L.lights) l.update(dt, this.time);
+
+    this.target = this.findTarget();
+    for (const p of L.possessables) p.tickCommon(dt, this.target === p);
+
+    // pressure plate <-> door
+    L.plate.update(dt, L);
+    if (L.plate.pressed === L.door.locked) {
+      L.door.setLocked(!L.plate.pressed);
+      L.doorLight.on = !L.door.locked;          // warm glow spilling in from the hall
+      if (!L.door.locked) {
+        this.shake = 0.35;
+        UI.objective.textContent = 'Door open — escape!';
+        UI.objective.classList.add('done');
+        this.hint('h-unlock', 'The exit door is unlocked!');
+      } else {
+        UI.objective.textContent = 'Keep the car on the plate';
+        UI.objective.classList.remove('done');
+        this.toast('The car rolled off — the door locked again!', 2.6);
+      }
+    }
+    L.door.update(dt);
+
+    Particles.update(dt);
+
+    // contextual hints
+    if (this.state === 'play' && !this.possessed && !this.ghost.hidden) {
+      const g = this.ghost;
+      if (this.target === L.lamp) this.hint('h-lamp', 'Press POSSESS to slip inside the lamp');
+      if (this.target === L.car)  this.hint('h-car', 'Possess the toy car');
+      if (!L.lampLight.on)        this.hint('h-dark', 'The doorway is safe now', 2.2);
+      if (dist(g.x, g.y, L.plate.x, L.plate.y) < L.plate.r)
+        this.hint('h-plate', 'Too light! The plate needs something heavy');
+      if (g.danger > 0.25) this.hint('h-burn', 'Get back in the shadows!', 2);
+    }
+
+    // state transitions
+    if (this.state === 'play') {
+      if (this.ghost.danger >= DANGER_TIME) this.fail();
+      else if (L.door.reached(this.ghost) && !this.possessed) this.win();
+    } else if (this.state === 'dying') {
+      this.timer -= dt;
+      if (this.timer <= 0.45 && UI.flash.classList.contains('on')) {
+        this.reset();
+        this.state = 'play';
+        UI.flash.classList.remove('on');
+        this.toast('The light got you! Try again.', 2.2);
+      }
+    } else if (this.state === 'win') {
+      this.winT += dt;
+      if (this.winT > 0.9 && UI.overlay.classList.contains('hidden')) {
+        UI.ovTitle.textContent = 'LEVEL COMPLETE!';
+        UI.ovText.textContent = 'The little ghost slipped away into the night.';
+        UI.overlay.classList.remove('hidden');
+      }
+      if (Math.random() < dt * 6) {
+        Particles.spawn({
+          x: rand(60, 480), y: rand(120, 700),
+          vx: rand(-30, 30), vy: rand(-60, -10),
+          life: rand(0.8, 1.6), size: rand(2, 5),
+          color: pick(['#fff2c8', '#9dffc8', '#a9e2ff']), shape: 'star', spin: rand(-5, 5)
+        });
+      }
+    }
+
+    this.syncUI();
+  },
+
+  /** Keep the contextual buttons in sync without thrashing the DOM. */
+  syncUI() {
+    const p = this.possessed;
+    let label = 'POSSESS', warm = false, showAction = false, showRelease = false;
+
+    if (this.state !== 'play') {
+      showAction = false;
+    } else if (p) {
+      const sub = p.actionLabel();
+      showAction = true;
+      showRelease = !!sub;
+      label = sub || 'RELEASE';
+      warm = !!sub;
+    } else if (this.target) {
+      showAction = true;
+    }
+
+    if (label !== this.lastLabel) { UI.btnAction.textContent = label; this.lastLabel = label; }
+    if (warm !== this.lastWarm) { UI.btnAction.classList.toggle('warm', warm); this.lastWarm = warm; }
+    if (showAction !== this.lastShowAction) {
+      UI.btnAction.classList.toggle('hidden', !showAction);
+      this.lastShowAction = showAction;
+    }
+    if (showRelease !== this.lastShowRelease) {
+      UI.btnRelease.classList.toggle('hidden', !showRelease);
+      this.lastShowRelease = showRelease;
+    }
+  },
+
+  /* ---------------- render ---------------- */
+  draw() {
+    const ctx = this.ctx, L = this.level;
+    ctx.setTransform(this.sx, 0, 0, this.sy, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    if (!L) return;
+
+    if (this.shake > 0) {
+      const s = this.shake * 6;
+      ctx.translate(rand(-s, s), rand(-s, s));
+    }
+
+    Draw.floor(ctx);
+    Draw.rug(ctx, L.rug);
+    Draw.plate(ctx, L.plate, this.time);
+    Draw.lights(ctx, L, this.time);
+    Draw.walls(ctx);
+    Draw.divider(ctx);
+
+    // furniture, back to front
+    const furn = L.rects.filter(r => r.kind).sort((a, b) => (a.y + a.h) - (b.y + b.h));
+    for (const r of furn) Draw.furniture(ctx, r);
+    for (const d of L.decor) Draw.decor(ctx, d);
+    for (const c of L.circles) {
+      if (c.kind === 'plant') Draw.plant(ctx, c, this.time);
+      if (c.kind === 'nightlamp') Draw.nightLamp(ctx, c, L.nightLight, this.time);
+    }
+
+    Draw.lamp(ctx, L.lamp, this.time);
+    Draw.fan(ctx, L.fan, this.time);
+    Draw.car(ctx, L.car, this.time);
+    Draw.door(ctx, L.door, this.time);
+
+    Draw.ghost(ctx, this.ghost, this.time);
+    Particles.draw(ctx);
+    Draw.dangerMeter(ctx, this.ghost);
+
+    ctx.setTransform(this.sx, 0, 0, this.sy, 0, 0);
+    Draw.vignette(ctx, this.ghost.hidden ? 0 : this.ghost.danger / DANGER_TIME);
+  }
+};
+
+// handy for tinkering from the console: GhostEscape.Game.level.lamp, etc.
+window.GhostEscape = { Game, Draw, SFX, Input, Particles };
+
+/* ---- boot ---- */
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', () => Game.init());
+} else {
+  Game.init();
+}
+
+// first gesture anywhere unlocks audio on mobile
+['pointerdown', 'touchstart', 'keydown'].forEach(ev =>
+  document.addEventListener(ev, () => { SFX.init(); SFX.resume(); }, { once: false, passive: true }));
+
+})();
