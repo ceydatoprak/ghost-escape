@@ -6,7 +6,7 @@
      0. Constants + math helpers
      1. SFX          — tiny Web Audio blip synth (lazy, user-gesture safe)
      2. Particles    — one flat particle pool
-     3. Input        — keyboard + virtual joystick + action buttons
+     3. Input        — keyboard + invisible drag-to-move + action buttons
      4. Collision    — circle vs AABB / circle, swept-ish resolve
      5. Entities     — Ghost, Possessable(Lamp/ToyCar/Fan), PressurePlate,
                        ExitDoor, LightHazard
@@ -225,20 +225,26 @@ const Particles = {
 };
 
 /* =============================================================================
-   3. INPUT — keyboard + dynamic virtual joystick (pointer events)
+   3. INPUT — keyboard + invisible drag-to-move (pointer events)
+
+   Touch anywhere in the play area and drag: the vector from the touch origin
+   to the finger is the movement vector. No on-screen stick, no teleporting —
+   it just feeds the same normalised vector the keyboard produces.
    ============================================================================= */
 
 const Input = {
   keys: Object.create(null),
-  joy: { active: false, id: null, dx: 0, dy: 0 },
+  drag: { active: false, id: null, dx: 0, dy: 0 },
   actionEdge: false,     // consumed once per press
   releaseEdge: false,
 
-  el: null, knob: null, frame: null,
-  homeLeft: 0, homeTop: 0, radius: 60,
+  frame: null,
+  deadZone: 9,           // px of slop before anything moves
+  fullDrag: 62,          // px of drag that means "full speed"
 
-  init(frame, joyEl, knobEl) {
-    this.frame = frame; this.el = joyEl; this.knob = knobEl;
+  init(frame) {
+    this.frame = frame;
+    this.measure();
 
     addEventListener('keydown', e => {
       const k = e.key.toLowerCase();
@@ -252,75 +258,82 @@ const Input = {
     }, { passive: false });
 
     addEventListener('keyup', e => { this.keys[e.key.toLowerCase()] = false; });
-    addEventListener('blur', () => { this.keys = Object.create(null); this.endJoy(); });
+    addEventListener('blur', () => { this.keys = Object.create(null); this.endDrag(); });
 
-    // ---- virtual joystick: any touch in the lower-left region grabs it ----
+    // ---- invisible drag pad: the whole play area, minus the UI ----
     frame.addEventListener('pointerdown', e => {
       SFX.init();
-      if (this.joy.active) return;
-      const r = frame.getBoundingClientRect();
-      const lx = e.clientX - r.left, ly = e.clientY - r.top;
-      if (lx > r.width * 0.62 || ly < r.height * 0.52) return;   // keep the play area free
-      this.joy.active = true;
-      this.joy.id = e.pointerId;
-      this.radius = this.el.offsetWidth / 2;
-      this.el.style.left = (lx - this.radius) + 'px';
-      this.el.style.top  = (ly - this.radius) + 'px';
-      this.el.style.right = 'auto'; this.el.style.bottom = 'auto';
-      this.el.classList.add('active');
+      if (this.drag.active) return;            // a second finger is free for buttons
+      if (this.isUI(e.target)) return;         // buttons and overlays keep their taps
+      this.drag.active = true;
+      this.drag.id = e.pointerId;
+      this.drag.dx = this.drag.dy = 0;
       this.origin = { x: e.clientX, y: e.clientY };
-      this.move(e);
       if (frame.setPointerCapture) { try { frame.setPointerCapture(e.pointerId); } catch (err) {} }
+      this.ripple(e.clientX, e.clientY);
       e.preventDefault();
     }, { passive: false });
 
     frame.addEventListener('pointermove', e => {
-      if (!this.joy.active || e.pointerId !== this.joy.id) return;
+      if (!this.drag.active || e.pointerId !== this.drag.id) return;
       this.move(e);
       e.preventDefault();
     }, { passive: false });
 
-    const up = e => { if (this.joy.active && e.pointerId === this.joy.id) this.endJoy(); };
+    const up = e => { if (this.drag.active && e.pointerId === this.drag.id) this.endDrag(); };
     frame.addEventListener('pointerup', up);
     frame.addEventListener('pointercancel', up);
     addEventListener('pointerup', up);
+    addEventListener('pointercancel', up);
 
-    // block browser gestures
+    // block browser gestures (zoom, pull-to-refresh, long-press menu)
     ['gesturestart', 'gesturechange', 'contextmenu'].forEach(ev =>
       document.addEventListener(ev, e => e.preventDefault(), { passive: false }));
     document.addEventListener('dblclick', e => e.preventDefault(), { passive: false });
+    document.addEventListener('touchmove', e => {
+      if (e.cancelable) e.preventDefault();
+    }, { passive: false });
 
-    this.park();
-    addEventListener('resize', () => this.park());
+    addEventListener('resize', () => this.measure());
   },
 
-  park() {                                   // resting position, bottom-left
-    if (!this.el || this.joy.active) return;
+  /** Scale the dead zone / full-speed distance to the screen. */
+  measure() {
+    if (!this.frame) return;
     const r = this.frame.getBoundingClientRect();
-    const size = this.el.offsetWidth || 120;
-    this.radius = size / 2;
-    this.homeLeft = r.width * 0.06;
-    this.homeTop  = r.height - size - r.height * 0.05;
-    this.el.style.left = this.homeLeft + 'px';
-    this.el.style.top = this.homeTop + 'px';
-    this.el.style.right = 'auto';
-    this.el.style.bottom = 'auto';
+    const base = Math.min(r.width, r.height * 0.5625) || 375;
+    this.deadZone = Math.max(6, base * 0.024);
+    this.fullDrag = Math.max(38, base * 0.17);
+  },
+
+  /** Taps that belong to the UI must never start a drag. */
+  isUI(el) {
+    return !!(el && el.closest && el.closest('button, #overlay, #intro'));
   },
 
   move(e) {
-    const max = this.radius * 0.72;
     let dx = e.clientX - this.origin.x, dy = e.clientY - this.origin.y;
     const d = Math.hypot(dx, dy);
-    if (d > max) { dx = dx / d * max; dy = dy / d * max; }
-    this.joy.dx = dx / max; this.joy.dy = dy / max;
-    this.knob.style.transform = `translate(${dx}px, ${dy}px)`;
+    if (d <= this.deadZone) { this.drag.dx = this.drag.dy = 0; return; }
+    // 0 at the dead zone edge, 1 once the drag passes fullDrag, clamped there
+    const mag = clamp((d - this.deadZone) / (this.fullDrag - this.deadZone), 0, 1);
+    this.drag.dx = (dx / d) * mag;
+    this.drag.dy = (dy / d) * mag;
   },
 
-  endJoy() {
-    this.joy.active = false; this.joy.id = null;
-    this.joy.dx = this.joy.dy = 0;
-    if (this.knob) this.knob.style.transform = 'translate(0,0)';
-    if (this.el) { this.el.classList.remove('active'); this.park(); }
+  endDrag() {
+    this.drag.active = false; this.drag.id = null;
+    this.drag.dx = this.drag.dy = 0;
+  },
+
+  /** A single soft ripple so the player knows the touch registered. */
+  ripple(clientX, clientY) {
+    const r = this.frame.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    const x = ((clientX - r.left) / r.width) * W;
+    const y = ((clientY - r.top) / r.height) * H;
+    Particles.spawn({ x, y, vx: 0, vy: 0, life: 0.36, size: 9, color: 'rgba(150,215,255,0.85)', shape: 'ring' });
+    Particles.spawn({ x, y, vx: 0, vy: 0, life: 0.22, size: 4, color: 'rgba(200,240,255,0.8)', shape: 'ring' });
   },
 
   /** Combined movement vector, magnitude clamped to 1. */
@@ -332,8 +345,8 @@ const Input = {
     if (k['w'] || k['arrowup'])    y -= 1;
     if (k['s'] || k['arrowdown'])  y += 1;
     if (x || y) { const m = Math.hypot(x, y); x /= m; y /= m; }
-    if (this.joy.active) {
-      x += this.joy.dx; y += this.joy.dy;
+    if (this.drag.active) {
+      x += this.drag.dx; y += this.drag.dy;
       const m = Math.hypot(x, y);
       if (m > 1) { x /= m; y /= m; }
     }
@@ -1584,9 +1597,7 @@ const UI = {
   btnAgain: document.getElementById('btn-again'),
   intro:    document.getElementById('intro'),
   btnStart: document.getElementById('btn-start'),
-  flash:    document.getElementById('flash'),
-  joy:      document.getElementById('joystick'),
-  knob:     document.getElementById('joy-knob')
+  flash:    document.getElementById('flash')
 };
 
 const Game = {
@@ -1610,7 +1621,7 @@ const Game = {
     addEventListener('resize', () => this.resize());
     addEventListener('orientationchange', () => setTimeout(() => this.resize(), 250));
 
-    Input.init(UI.frame, UI.joy, UI.knob);
+    Input.init(UI.frame);
     this.bindUI();
     this.reset();
 
@@ -1632,7 +1643,7 @@ const Game = {
     UI.canvas.height = Math.max(1, Math.round(r.height * dpr));
     this.sx = (r.width * dpr) / W;
     this.sy = (r.height * dpr) / H;
-    Input.park();
+    Input.measure();
   },
 
   bindUI() {
@@ -1654,7 +1665,9 @@ const Game = {
     tap(UI.btnStart,   () => {
       UI.intro.classList.add('hidden');
       this.state = 'play';
-      this.toast('Stay in the dark. Warm light burns!', 3.2);
+      const touch = !!(window.matchMedia && matchMedia('(pointer: coarse)').matches);
+      this.toast(touch ? 'Drag anywhere to move · stay in the dark!'
+                       : 'Stay in the dark. Warm light burns!', 3.2);
     });
   },
 

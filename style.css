@@ -113,33 +113,7 @@ html,body{
 }
 #toast.show{ opacity:1; transform:translate(-50%,0); }
 
-/* ================= Joystick ================= */
-#joystick{
-  position:absolute;
-  left:6%; bottom:5%;
-  width:clamp(110px,33vw,160px);
-  aspect-ratio:1;
-  pointer-events:none;
-  opacity:.55;
-  transition:opacity .2s;
-}
-#joystick.active{ opacity:1; }
-#joy-base{
-  position:absolute; inset:0;
-  border-radius:50%;
-  border:2px solid rgba(150,195,255,.28);
-  background:radial-gradient(circle at 50% 40%, rgba(80,120,220,.20), rgba(10,16,40,.38));
-  box-shadow:inset 0 0 22px rgba(90,140,255,.16);
-}
-#joy-knob{
-  position:absolute; left:50%; top:50%;
-  width:44%; aspect-ratio:1;
-  margin:-22% 0 0 -22%;
-  border-radius:50%;
-  background:radial-gradient(circle at 40% 35%, #eaf4ff, #8fc2ff 60%, #4d7fd6);
-  box-shadow:0 4px 16px rgba(80,150,255,.5), inset 0 -3px 8px rgba(0,0,0,.2);
-  transition:transform .06s linear;
-}
+/* Movement has no UI: the whole play area is an invisible drag pad. */
 
 /* ================= Action buttons ================= */
 #action-stack{

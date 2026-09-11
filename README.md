@@ -20,7 +20,7 @@ It is also GitHub-Pages ready: push and enable Pages on the repository root.
 
 | | Desktop | Mobile |
 |---|---|---|
-| Move | `WASD` / arrow keys | virtual joystick (drag anywhere in the lower-left) |
+| Move | `WASD` / arrow keys | drag anywhere in the play area (invisible, no on-screen stick) |
 | Possess / toggle | `E`, `Space` | big button, bottom-right |
 | Release | `Q`, `Esc` | `RELEASE` button |
 | Restart | ↻ button, top-right | ↻ button, top-right |
@@ -55,7 +55,7 @@ Everything lives in one file, `game.js`, split into commented sections:
 | 0 | constants, math helpers |
 | 1 | `SFX` — tiny Web Audio blip synth, initialised on first user gesture |
 | 2 | `Particles` — one flat pool |
-| 3 | `Input` — keyboard + dynamic virtual joystick (pointer events) |
+| 3 | `Input` — keyboard + invisible drag-to-move (pointer events) |
 | 4 | `Collide` — circle vs AABB / circle |
 | 5 | `LightHazard`, `Possessable` (`FloorLamp`, `ToyCar`, `Fan`), `PressurePlate`, `ExitDoor`, `Ghost` |
 | 6 | `buildLevel()` — all level-1 geometry in one place |
