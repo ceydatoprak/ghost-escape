@@ -103,55 +103,55 @@ goes back, and the door locks again.
 
 ## Level 5 flow — "Distraction"
 
-The housemate stops being only an obstacle. Two objects make a noise on
-command, and anything within earshot comes to look: they walk their own patrol
-line to the nearest waypoint, step across to the source, have a 1.7 s look
-round, then walk back and carry on. They can still see you the whole time —
-a distraction buys space, not invisibility.
+Two sentries, each planted in front of a narrow doorway, never looking away.
+No amount of waiting opens either one — the only thing that moves a sentry is
+a noise somewhere else, and each noise is only loud enough to reach the guard
+it is meant for.
 
-Three rooms, and the route zig-zags so that each noise pulls them *backwards*
-along it:
+1. Slip down the middle lane of the start room to the **radio** (it sits beyond
+   the first sentry's reach, so ringing it is safe) and set it off.
+2. They trudge down the middle lane to investigate. Go back up the **west
+   lane** — the guard's route and yours never share a corridor — and through
+   the first doorway behind them.
+3. In the middle room, cross to the **alarm clock** on the east side and ring
+   that. The second sentry leaves their doorway to look.
+4. Take the southern way round while they walk east, then up through the second
+   doorway and out.
 
-1. Start in the dark corner and possess the **radio**. Press the button: they
-   trudge all the way down to the west corner of the start room to investigate.
-2. Slip out of the room's *east* doorway and cross the empty hallway west,
-   ducking into the **laundry basket** or **flower pot** if they come back.
-3. Go up into the exit room and possess the **alarm clock**. Ringing it turns
-   their long stare across the room into a stare at the west wall.
-4. Cross east behind them, up the last doorway, and west to the door.
-
-Each object has a ~4.5 s cooldown (a thin ring drains around it) so you cannot
-just spam noise, and the button reads `QUIET…` while it recovers.
+Verified by simulation: with both sentries at their posts, every lane of both
+doorways is seen at every point in their shuffle — so neither passage can be
+crossed without its noise.
 
 ## Level 6 flow — "Light & Shadow"
 
-The lighting itself is the puzzle. Lit floor is dangerous at a distance — the
-housemate sees 260px into it — while in darkness they only notice you inside
-60px. Their vision cone shows both: the long reach is drawn *only over lit
-floor*, with a short bright core that catches you anywhere. Two lamps are
-yours to rearrange, and walls cast real shadows out of every light.
+Here the light **burns**. Both lamps have to be dealt with.
 
-1. The start corner is dark. The only doorway out is washed in light from a
-   **standing lamp** — approach it from below, where its beam does not reach.
-2. Possess it and **TURN OFF**. The doorway goes dark; if they are close by
-   they glance over with a "?" and lose a second before carrying on.
-3. Cross, using the **laundry basket** and **cardboard box** while they pace.
-4. Past the middle doorway sits the **table lamp**, right at the fork. Its beam
-   starts aimed up the right-hand way. Possess it and **drag left or right** to
-   swing the beam — the dial shows its limits.
-5. Aim it at the way you are *not* taking, then walk up the dark one. Aiming it
-   straight up is the trap: both ways go dark but the door itself lights up.
+1. The only way out of the start room is a doorway flooded by a **standing
+   lamp**, and the lit stretch beyond it is far too deep to sprint: every lane
+   and both diagonals fill the danger timer before you are clear. Approach the
+   lamp from below, where its beam does not reach, and switch it off.
+2. Cross the hallway and go up to the **table lamp** at the mouth of the exit
+   corridor. Their vision cone is a fixed size here — darkness hides you from
+   the lamps, not from them.
+3. Its beam starts pointing straight up that corridor, which makes the last
+   stretch lethal on every lane. Possess it and **drag left or right**: swing
+   the beam onto one side and the opposite lane of the corridor goes dark.
+4. Walk up the dark lane to the door.
 
-Measured over a full patrol, each gate roughly doubles your chances: the lit
-doorway is caught from 6 of 24 start moments versus 3 in the dark, and a route
-with the beam on it 14/24 versus 8/24 with the beam aimed away. Hiding and
-timing still matter — the light only ever shifts the odds.
+Every lamp you touch gives you away. Flicking lamp 1 either way, or swinging
+lamp 2 by more than about ten degrees, makes the housemate stop, show a '?',
+and come over: they walk a little faster than usual, look left, look right,
+then go back to their round. While they are suspicious they also peer much
+over, so the trick is **change the
+light, leave the lamp, and hide** — the flower pot sits near lamp 1 and the
+cardboard box near lamp 2. Sitting inside the lamp they are inspecting does
+not work: you get one shouted warning and then you are caught.
 
 ## Light hazard
 
 Standing in warm light starts a 1.5 second timer (shown as a bar over the
 ghost, plus a red vignette). Leave the light and the ghost recovers. Stay, and
-the level restarts. (Levels 2–5 have no burning light — only being seen.)
+the level restarts. Levels 2–5 have no burning light (only being seen); level 6 brings it back as the core puzzle.
 
 ## Code layout
 

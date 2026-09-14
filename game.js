@@ -431,7 +431,7 @@ const Collide = {
         if (r.disabled) continue;                       // an opened gate stops colliding
         if (this.circleRect(body, r)) hit = true;
       }
-      for (const o of level.circles) if (this.circleCircle(body, o)) hit = true;
+      for (const o of level.circles) { if (o.ghost) continue; if (this.circleCircle(body, o)) hit = true; }
       if (movers) {                                     // push-able props are solid too
         for (const m of movers) if (m !== body && this.circleCircle(body, m)) hit = true;
       }
@@ -642,7 +642,16 @@ class RotatingLamp extends Possessable {
     this.spin = 0;
   }
   actionLabel() { return null; }              // the big button stays RELEASE
-  update(dt, input) {
+  update(dt, input, level) {
+    // a drag counts as one interaction: remember where it started
+    const dragging = !!(this.possessed && input && Math.abs(input.x) > 0.2);
+    if (dragging && !this.dragging) { this.dragging = true; this.dirAtGrab = this.dir; }
+    else if (!dragging && this.dragging) {
+      this.dragging = false;
+      if (Math.abs(this.dir - this.dirAtGrab) > 0.17 && level && level.lampAlert) {
+        level.lampAlert(this);                 // moved more than ~10 degrees
+      }
+    }
     const want = (this.possessed && input) ? clamp(input.x, -1, 1) * 1.6 : 0;
     this.spin = lerp(this.spin, want, smooth(dt, this.possessed ? 0.02 : 0.0005));
     if (Math.abs(this.spin) > 0.002) {
@@ -1002,7 +1011,12 @@ class Human {
       pause: 1.2,           // seconds spent at each end of the route
       range: 190,           // how far they can see into a lit area
       darkRange: 0,         // ...and into darkness (0 = same as range)
+      alertDarkRange: 0,    // ...and into darkness while investigating (0 = same)
       half: 0.46,           // half the cone angle, radians
+      sentry: null,         // [x,y] they keep watching, whatever their feet do
+      noticeDelay: 0,       // beat of '?' before they set off (0 = go at once)
+      investigateBoost: 1,  // they walk a little faster when suspicious
+      scanWide: false,      // proper look-left-look-right scan at the scene
       name: 'human'
     }, o);
     if (!this.darkRange) this.darkRange = this.range;
@@ -1030,9 +1044,10 @@ class Human {
    * (so they can never cut a corner through a wall), step across to `spot`,
    * have a look round, then walk back and carry on where they left off.
    */
-  investigate(anchor, spot, sx, sy) {
-    if (this.mode) return false;                 // already busy having a look
-    this.mode = 'route';
+  investigate(anchor, spot, sx, sy, force) {
+    if (this.mode && !force) return false;       // already busy having a look
+    this.mode = this.noticeDelay > 0 ? 'notice' : 'route';
+    this.noticeT = this.noticeDelay;
     this.invAnchor = clamp(anchor | 0, 0, this.path.length - 1);
     this.invSpot = spot;
     this.lookX = sx; this.lookY = sy;
@@ -1048,7 +1063,7 @@ class Human {
       const dx = tx - this.x, dy = ty - this.y;
       const d = Math.hypot(dx, dy);
       if (d < 3) return true;
-      const move = Math.min(this.speed * dt, d);
+      const move = Math.min(this.speed * this.investigateBoost * dt, d);
       this.x += (dx / d) * move;
       this.y += (dy / d) * move;
       this.bob += move * 0.09;
@@ -1056,6 +1071,12 @@ class Human {
       return false;
     };
 
+    if (this.mode === 'notice') {                // freeze for a beat, then go
+      this.noticeT -= dt;
+      this.faceTowards(this.lookX, this.lookY, dt, 3.4);
+      if (this.noticeT <= 0) this.mode = 'route';
+      return;
+    }
     if (this.mode === 'route') {                 // along the patrol to the anchor
       const n = this.path[this.target];
       if (step(n.x, n.y)) {
@@ -1065,13 +1086,19 @@ class Human {
     } else if (this.mode === 'toSound') {        // the short hop to the spot
       if (step(this.invSpot[0], this.invSpot[1])) {
         this.mode = 'inspect';
-        this.inspectT = 1.7;
+        this.inspectT = this.scanWide ? 2.2 : 1.7;
       }
     } else if (this.mode === 'inspect') {        // a look round, then done
       this.inspectT -= dt;
       const base = Math.atan2(this.lookY - this.y, this.lookX - this.x);
-      const sway = Math.sin(this.inspectT * 3.4) * 0.45;
-      this.angle += clamp(angDiff(base + sway, this.angle), -3.2 * dt, 3.2 * dt);
+      let off;
+      if (this.scanWide) {                       // left ... right ... forward
+        const t = this.inspectT;
+        off = t > 1.55 ? -0.95 : t > 1.0 ? -0.95 : t > 0.45 ? 0.95 : 0;
+      } else {
+        off = Math.sin(this.inspectT * 3.4) * 0.45;
+      }
+      this.angle += clamp(angDiff(base + off, this.angle), -3.2 * dt, 3.2 * dt);
       if (this.inspectT <= 0) this.mode = 'back';
     } else if (this.mode === 'back') {           // back to the patrol line
       const a = this.path[this.invAnchor];
@@ -1108,7 +1135,7 @@ class Human {
       this.paused -= dt;
       // a waypoint may name a spot to stare at while standing there
       const node = this.path[this.pauseNode];
-      const f = node && node.face;
+      const f = this.sentry || (node && node.face);
       if (f) this.faceTowards(f[0], f[1], dt, 3.0);
       else this.faceTowards(n.x, n.y, dt, 3.0);
       return;
@@ -1134,7 +1161,9 @@ class Human {
     this.x += (dx / d) * move;
     this.y += (dy / d) * move;
     this.bob += move * 0.09;
-    this.faceTowards(n.x, n.y, dt, 4.5);
+    // a sentry never takes their eyes off the thing they are guarding
+    if (this.sentry) this.faceTowards(this.sentry[0], this.sentry[1], dt, 3.4);
+    else this.faceTowards(n.x, n.y, dt, 4.5);
   }
 
   /** Can this human see the point? Cone + range + walls. */
@@ -1142,8 +1171,10 @@ class Human {
     const dx = x - this.x, dy = y - this.y;
     const d = Math.hypot(dx, dy);
     // in the dark they have to be much closer before they notice anything
-    const range = (this.darkRange < this.range && level.brightAt && !level.brightAt(x, y))
-      ? this.darkRange : this.range;
+    // while they are suspicious they peer much harder into the dark
+    const dark = (this.mode && this.alertDarkRange) ? this.alertDarkRange : this.darkRange;
+    const range = (dark < this.range && level.brightAt && !level.brightAt(x, y))
+      ? dark : this.range;
     if (d > range) return false;
     if (d < 14) return true;
     const a = Math.atan2(dy, dx);
@@ -1557,16 +1588,18 @@ function buildLevel4() {
    ----------------------------------------------------------------------------- */
 
 const L5 = {
-  // start room has two doorways: the ghost leaves by the east one while the
-  // housemate is lured down to the west one
-  wallA: { y0: 640, y1: 668, x0: 150, x1: 380 },
-  wallB: { y0: 312, y1: 340, startX: 180 },   // hallway -> exit room, doorway west
-  wallC: { y0: 150, y1: 178, endX: 360 }      // exit room -> door strip, doorway east
+  wallA: { y0: 700, y1: 728, gx0: 250, gx1: 310 },   // narrow passage, guarded
+  wallB: { y0: 372, y1: 400, gx0: 120, gx1: 200 }    // second passage, also guarded
 };
 
 function buildLevel5() {
   const L = {};
-  const A = L5.wallA, B = L5.wallB, C = L5.wallC;
+  const A = L5.wallA, B = L5.wallB;
+  // short walls that split the start room into lanes - drawn, not invisible
+  L.walls = [
+    { x: 150, y: 786, w: 24, h: 96 },
+    { x: 386, y: 786, w: 24, h: 96 }
+  ];
 
   L.rects = [
     { x: -60, y: 0, w: 84, h: H },                                  // left wall
@@ -1575,58 +1608,51 @@ function buildLevel5() {
     { x: -60, y: -60, w: 60 + DOOR.x0, h: 84 },                     // top wall, left of door
     { x: DOOR.x1, y: -60, w: W - DOOR.x1 + 60, h: 84 },             // top wall, right of door
     { x: DOOR.x0, y: -90, w: DOOR.x1 - DOOR.x0, h: 96 },            // the door itself
-    { x: A.x0, y: A.y0, w: A.x1 - A.x0, h: A.y1 - A.y0 },           // wall A (two doorways)
-    { x: B.startX, y: B.y0, w: W - B.startX + 60, h: B.y1 - B.y0 }, // wall B
-    { x: -60, y: C.y0, w: 60 + C.endX, h: C.y1 - C.y0 },            // wall C
+    { x: -60, y: A.y0, w: 60 + A.gx0, h: A.y1 - A.y0 },             // wall A, both sides
+    L.walls[0], L.walls[1],                                         // lane stubs in the start room
+    { x: A.gx1, y: A.y0, w: W - A.gx1 + 60, h: A.y1 - A.y0 },
+    { x: -60, y: B.y0, w: 60 + B.gx0, h: B.y1 - B.y0 },             // wall B, both sides
+    { x: B.gx1, y: B.y0, w: W - B.gx1 + 60, h: B.y1 - B.y0 },
 
     // ---- furniture ----
-    { x: 180, y: 690, w: 150, h: 80,  kind: 'sofa' },       // start room
-    { x: 200, y: 850, w: 96,  h: 50,  kind: 'table' },
-    { x: 390, y: 880, w: 110, h: 40,  kind: 'tv' },
-    { x: 230, y: 350, w: 84,  h: 80,  kind: 'dresser' },    // hallway
-    { x: 400, y: 180, w: 56,  h: 56,  kind: 'nightstand' }, // exit room
-    { x: 60,  y: 44,  w: 96,  h: 56,  kind: 'table' }       // door strip
+    { x: 424, y: 806, w: 80,  h: 64,  kind: 'dresser' },    // start room, east lane only
+    { x: 40,  y: 630, w: 84,  h: 76,  kind: 'dresser' },    // middle room
+    { x: 430, y: 410, w: 56,  h: 56,  kind: 'nightstand' },
+    { x: 330, y: 60,  w: 150, h: 140, kind: 'bed' },        // exit room
+    { x: 60,  y: 210, w: 56,  h: 56,  kind: 'nightstand' }
   ];
 
   L.circles = [
-    { x: 486, y: 760, r: 22, kind: 'plant', seed: 16 },
-    { x: 60,  y: 560, r: 20, kind: 'plant', seed: 17 },
-    { x: 486, y: 110, r: 20, kind: 'plant', seed: 18 },
-    { x: 170, y: 880, r: 17, kind: 'hidebase' },
-    { x: 430, y: 600, r: 17, kind: 'hidebase' },
-    { x: 148, y: 430, r: 17, kind: 'hidebase' },
-    { x: 300, y: 288, r: 17, kind: 'hidebase' },
-    { x: 80,  y: 740, r: 15, kind: 'noisebase' },           // radio
-    { x: 70,  y: 250, r: 15, kind: 'noisebase' }            // alarm clock
+    { x: 60,  y: 640, r: 22, kind: 'plant', seed: 16 },
+    { x: 486, y: 640, r: 20, kind: 'plant', seed: 17 },
+    { x: 486, y: 250, r: 20, kind: 'plant', seed: 18 },
+    { x: 58,  y: 892, r: 17, kind: 'hidebase' },
+    { x: 420, y: 640, r: 17, kind: 'hidebase' },
+    { x: 300, y: 450, r: 17, kind: 'hidebase' },
+    { x: 300, y: 210, r: 17, kind: 'hidebase' },
+    { x: 280, y: 916, r: 15, kind: 'noisebase' },           // radio
+    { x: 430, y: 470, r: 15, kind: 'noisebase' }            // alarm clock
   ];
 
   L.doorLight = new LightHazard({
     x: (DOOR.x0 + DOOR.x1) / 2, y: 44, dir: Math.PI / 2, half: 0.62, len: 120,
     on: true, dangerous: false, nearSafe: 0
   });
-  L.nightLight = new LightHazard({
-    x: 486, y: 806, dir: -Math.PI / 2, half: 0.62, len: 120,
-    on: true, dangerous: false, nearSafe: 0
-  });
-  L.lights = [L.doorLight, L.nightLight];
+  L.lights = [L.doorLight];
 
-  // ---- two things to make a racket with, each luring them backwards ----
-  // radio: drags them all the way down to the start room's west corner while
-  // the ghost slips out of the east doorway and crosses the empty hallway
-  L.radio = new DistractionObject(80, 740, 'radio', {
-    anchor: 1, spot: [104, 700], hearing: 560
+  // ---- one noise per guard: each is only audible to the one it has to move ----
+  L.radio = new DistractionObject(280, 916, 'radio', {
+    anchor: 0, spot: [280, 878], hearing: 200
   });
-  // clock: turns their long stare across the exit room into a stare at the
-  // west wall, so the ghost can cross east behind them
-  L.clock = new DistractionObject(70, 250, 'clock', {
-    anchor: 2, spot: [108, 252], hearing: 560
+  L.clock = new DistractionObject(430, 470, 'clock', {
+    anchor: 0, spot: [392, 478], hearing: 320
   });
 
   L.possessables = [
-    new HideSpot(170, 880, 'teddy',  'teddy bear'),    // start room corner
-    new HideSpot(430, 600, 'basket', 'laundry basket'),// hallway east, after the doorway
-    new HideSpot(148, 430, 'pot',    'flower pot'),    // hallway west, beside the doorway
-    new HideSpot(300, 288, 'box',    'cardboard box'), // exit room, beside the crossing
+    new HideSpot(58, 892, 'teddy',  'teddy bear'),     // start room, west lane
+    new HideSpot(420, 640, 'basket', 'laundry basket'),// middle room, past passage 1
+    new HideSpot(300, 450, 'pot',    'flower pot'),    // middle room, before passage 2
+    new HideSpot(300, 210, 'box',    'cardboard box'), // exit room
     L.radio,
     L.clock
   ];
@@ -1635,30 +1661,32 @@ function buildLevel5() {
   L.door.locked = false;
   L.door.open = 1;
 
-  // they stare down the hallway from one end and across the exit room from the
-  // other — exactly the two stretches the ghost has to cross
-  L.humans = [new Human({
-    path: [
-      { x: 440, y: 520, face: [140, 545] },   // A — hallway east, looking west
-      { x: 150, y: 480 },                     // B — hallway west
-      { x: 170, y: 250, face: [460, 262] }    // C — exit room, looking east
-    ],
-    speed: 92, pause: 2.0, range: 195, half: 0.46
-  })];
+  // Two sentries. Each one stands in front of its passage and never looks away,
+  // so no amount of waiting opens either doorway — only a noise elsewhere does.
+  L.humans = [
+    new Human({                                   // guards the first passage
+      path: [{ x: 268, y: 770 }, { x: 282, y: 770 }],
+      sentry: [280, 600], speed: 24, pause: 1.4, range: 110, half: 0.62
+    }),
+    new Human({                                   // guards the second passage
+      path: [{ x: 153, y: 450 }, { x: 167, y: 450 }],
+      sentry: [160, 280], speed: 24, pause: 1.4, range: 110, half: 0.62
+    })
+  ];
 
-  L.rug = { x: 250, y: 800, rx: 120, ry: 52 };
+  L.rug = { x: 280, y: 840, rx: 96, ry: 40 };
   L.decor = [
-    { x: 300, y: 812, r: 13, kind: 'cushion', hue: '#5b6bb8' },
-    { x: 210, y: 786, r: 12, kind: 'cushion', hue: '#7a5b9e' },
-    { x: 240, y: 862, r: 11, kind: 'books' },
-    { x: 96,  y: 66,  r: 10, kind: 'mug' }
+    { x: 300, y: 846, r: 13, kind: 'cushion', hue: '#5b6bb8' },
+    { x: 248, y: 832, r: 12, kind: 'cushion', hue: '#7a5b9e' },
+    { x: 462, y: 790, r: 11, kind: 'books' },
+    { x: 86,  y: 218, r: 10, kind: 'mug' }
   ];
 
   L.dividers = [
-    { y0: A.y0, y1: A.y1, segs: [[A.x0, A.x1]],
-      jambs: [{ x: A.x0, side: 1 }, { x: A.x1, side: -1 }] },
-    { y0: B.y0, y1: B.y1, segs: [[B.startX, ROOM.x1]], jambs: [{ x: B.startX, side: 1 }] },
-    { y0: C.y0, y1: C.y1, segs: [[ROOM.x0, C.endX]], jambs: [{ x: C.endX, side: -1 }] }
+    { y0: A.y0, y1: A.y1, segs: [[ROOM.x0, A.gx0], [A.gx1, ROOM.x1]],
+      jambs: [{ x: A.gx0, side: -1 }, { x: A.gx1, side: 1 }] },
+    { y0: B.y0, y1: B.y1, segs: [[ROOM.x0, B.gx0], [B.gx1, ROOM.x1]],
+      jambs: [{ x: B.gx0, side: -1 }, { x: B.gx1, side: 1 }] }
   ];
 
   finishLevel(L);
@@ -1675,12 +1703,17 @@ function buildLevel5() {
 
 const L6 = {
   wallA: { y0: 560, y1: 588, endX: 300 },                 // doorway on the right
-  wallB: { y0: 300, y1: 328, gx0: 200, gx1: 330 }         // doorway in the middle
+  wallB: { y0: 346, y1: 374, gx0: 200, gx1: 330 }         // doorway in the middle
 };
 
 function buildLevel6() {
   const L = {};
   const A = L6.wallA, B = L6.wallB;
+  // the walls of the exit corridor - drawn, not invisible
+  L.walls = [
+    { x: 170, y: 24, w: 32, h: 274 },
+    { x: 286, y: 24, w: 32, h: 274 }
+  ];
 
   L.rects = [
     { x: -60, y: 0, w: 84, h: H },                                  // left wall
@@ -1692,15 +1725,13 @@ function buildLevel6() {
     { x: -60, y: A.y0, w: 60 + A.endX, h: A.y1 - A.y0 },            // wall A
     { x: -60, y: B.y0, w: 60 + B.gx0, h: B.y1 - B.y0 },             // wall B, left part
     { x: B.gx1, y: B.y0, w: W - B.gx1 + 60, h: B.y1 - B.y0 },       // wall B, right part
+    L.walls[0], L.walls[1],                                         // the exit corridor's walls
 
     // ---- furniture ----
     { x: 50,  y: 672, w: 140, h: 80,  kind: 'sofa' },       // start room
     { x: 200, y: 800, w: 96,  h: 56,  kind: 'table' },
     { x: 330, y: 880, w: 130, h: 40,  kind: 'tv' },
     { x: 40,  y: 440, w: 84,  h: 96,  kind: 'dresser' },    // middle corridor
-    // the bed splits the last room into a left and a right way round; light
-    // still sweeps over it, so the lamp decides which way is safe
-    { x: 190, y: 92,  w: 160, h: 148, kind: 'bed' },
     { x: 60,  y: 44,  w: 56,  h: 56,  kind: 'nightstand' }  // exit strip
   ];
 
@@ -1709,22 +1740,22 @@ function buildLevel6() {
     { x: 60,  y: 380, r: 20, kind: 'plant', seed: 14 },
     { x: 486, y: 58,  r: 20, kind: 'plant', seed: 15 },
     { x: 410, y: 648, r: 16, kind: 'lampbase' },            // the standing lamp
-    { x: 265, y: 262, r: 15, kind: 'aimlampbase' },         // the table lamp
+    { x: 244, y: 318, r: 15, kind: 'aimlampbase', ghost: true }, // drawn only: it must not block the corridor
     { x: 140, y: 820, r: 17, kind: 'hidebase' },
     { x: 330, y: 690, r: 17, kind: 'hidebase' },
     { x: 360, y: 510, r: 17, kind: 'hidebase' },
-    { x: 150, y: 360, r: 17, kind: 'hidebase' }
+    { x: 150, y: 410, r: 17, kind: 'hidebase' }
   ];
 
   // ---- lamp 1: lights the only doorway out of the start room ----
   L.lamp1Light = new LightHazard({
-    x: 410, y: 648, dir: -Math.PI / 2, half: 1.0, len: 280,
-    on: true, dangerous: false, bright: true, occluded: true, nearSafe: 24
+    x: 410, y: 648, dir: -Math.PI / 2, half: 1.0, len: 340,
+    on: true, dangerous: true, bright: true, occluded: true, nearSafe: 24
   });
   // ---- lamp 2: aimable, covers both ways past the island wall ----
   L.lamp2Light = new LightHazard({
-    x: 265, y: 262, dir: -0.75, half: 0.55, len: 320,
-    on: true, dangerous: false, bright: true, occluded: true, nearSafe: 22
+    x: 244, y: 318, dir: -Math.PI / 2, half: 0.55, len: 340,
+    on: true, dangerous: true, bright: true, occluded: true, nearSafe: 8
   });
   L.doorLight = new LightHazard({
     x: (DOOR.x0 + DOOR.x1) / 2, y: 44, dir: Math.PI / 2, half: 0.62, len: 120,
@@ -1733,13 +1764,13 @@ function buildLevel6() {
   L.lights = [L.lamp1Light, L.lamp2Light, L.doorLight];
 
   L.lamp = new FloorLamp(410, 648, L.lamp1Light);                       // on/off
-  L.aimLamp = new RotatingLamp(265, 262, L.lamp2Light, -2.50, -0.64);   // aimable
+  L.aimLamp = new RotatingLamp(244, 318, L.lamp2Light, -2.30, -0.84);   // aimable
 
   L.possessables = [
     new HideSpot(140, 820, 'teddy',  'teddy bear'),     // dark start corner
     new HideSpot(330, 690, 'pot',    'flower pot'),     // beside lamp 1
     new HideSpot(360, 510, 'basket', 'laundry basket'), // just past the doorway
-    new HideSpot(150, 360, 'box',    'cardboard box'),  // before the middle doorway
+    new HideSpot(150, 410, 'box',    'cardboard box'),  // before the middle doorway
     L.lamp,
     L.aimLamp
   ];
@@ -1752,14 +1783,24 @@ function buildLevel6() {
     path: [
       // A — stands at the top of the doorway staring down it into the start room
       { x: 455, y: 505, face: [430, 700] },
-      { x: 250, y: 420 },                              // B — across the corridor
-      // C — stops below the bed and looks up the left-hand way
-      { x: 230, y: 286, pause: 1.8, face: [100, 90] },
-      // D — and at the far end, up the right-hand way
-      { x: 430, y: 286, face: [470, 90] }
+      { x: 250, y: 450 },                              // B — across the hallway
+      // C — peers up through the middle doorway at the exit corridor
+      { x: 250, y: 396, face: [244, 120] }
     ],
-    speed: 100, pause: 2.2, range: 260, darkRange: 60, half: 0.46
+    speed: 100, pause: 2.2, range: 210, half: 0.46,
+    noticeDelay: 0.35, investigateBoost: 1.15, scanWide: true
   })];
+
+  // ---- every lamp change is suspicious: they come over and have a look ----
+  L.lampInvestigation = true;
+  L.lamp.anchor = 0;    L.lamp.spot = [430, 600];      // just short of the standing lamp
+  L.aimLamp.anchor = 2; L.aimLamp.spot = [292, 336];   // just short of the table lamp
+  L.lampAlert = function (obj) {
+    this.investigating = obj;
+    obj.pop = 1;
+    Particles.spawn({ x: obj.x, y: obj.y - 8, vx: 0, vy: 0, life: 0.6, size: 15, color: '#ffd0a8', shape: 'ring' });
+    for (const h of this.humans) h.investigate(obj.anchor, obj.spot, obj.x, obj.y, true);
+  };
 
   L.rug = { x: 240, y: 850, rx: 130, ry: 58 };
   L.decor = [
@@ -1851,10 +1892,10 @@ const LEVELS = [
   },
   {
     name: 'Level 5', subtitle: 'Distraction', objective: 'Make them look away',
-    spawn: { x: 100, y: 890 }, build: buildLevel5,
+    spawn: { x: 80, y: 906 }, build: buildLevel5,
     winTitle: 'LEVEL 5 COMPLETE!',
     winText: 'Two noises, one very confused housemate.',
-    startHint: 'Possess the radio or the clock and make a noise — they will go and look.'
+    startHint: 'Both doorways are watched. Make a noise somewhere else to move them.'
   },
   {
     name: 'Level 6', subtitle: 'Light & Shadow', objective: 'Make your own darkness',
@@ -2357,11 +2398,11 @@ const Draw = {
       ctx.beginPath(); ctx.arc(12, -16, 5.5, Math.PI * 0.8, Math.PI * 2.1); ctx.fill();
       ctx.strokeStyle = '#cfd8ec'; ctx.lineWidth = 2.4; ctx.lineCap = 'round';
       ctx.beginPath(); ctx.moveTo(-7, -16); ctx.lineTo(7, -16); ctx.stroke();   // bar
-      ctx.strokeStyle = '#c4585e'; ctx.lineWidth = 3; ctx.lineCap = 'round';
+      ctx.strokeStyle = '#4f7fd0'; ctx.lineWidth = 3; ctx.lineCap = 'round';
       ctx.beginPath(); ctx.moveTo(-9, 10); ctx.lineTo(-14, 16); ctx.stroke();   // feet
       ctx.beginPath(); ctx.moveTo(9, 10); ctx.lineTo(14, 16); ctx.stroke();
       const cg = ctx.createLinearGradient(0, -14, 0, 12);
-      cg.addColorStop(0, '#e4737a'); cg.addColorStop(1, '#b4484f');
+      cg.addColorStop(0, '#6ea3e8'); cg.addColorStop(1, '#3f6bb0');
       ctx.fillStyle = cg;
       ctx.beginPath(); ctx.arc(0, -2, 15, 0, TAU); ctx.fill();
       ctx.fillStyle = '#fdf2e4';                                  // face
@@ -3369,6 +3410,7 @@ const Game = {
     this.actionLock = 0;
     this.lockedHintT = 0;
     this.lockedNagT = 0;
+    this.lampBust = 0;
     Particles.clear();
     UI.levelTitle.textContent = def.name;
     UI.objective.textContent = def.objective;
@@ -3500,7 +3542,8 @@ const Game = {
       if (p.actionLabel()) {
         const did = p.activate();            // lamp / fan toggle, radio, clock...
         // a lamp clicking off is the kind of thing a housemate notices
-        if (p.light && this.level.lampChanged) this.level.lampChanged(p.x, p.y);
+        if (p.light && this.level.lampAlert) this.level.lampAlert(p);
+        else if (p.light && this.level.lampChanged) this.level.lampChanged(p.x, p.y);
         // ...and a noise sends them over to look
         if (p.noisy && did && this.level.makeNoise) {
           this.level.makeNoise(p);
@@ -3633,7 +3676,7 @@ const Game = {
     if (L.fan) L.fan.update(dt);
     // aimable lamps: the drag steers the beam while the ghost is inside one
     for (const p of L.possessables) {
-      if (p.rotatable) p.update(dt, p === this.possessed ? input : null);
+      if (p.rotatable) p.update(dt, p === this.possessed ? input : null, L);
       else if (p.noisy) p.update(dt);          // cooldown + buzz + sound rings
     }
     for (const l of L.lights) l.update(dt, this.time);
@@ -3642,6 +3685,24 @@ const Game = {
     for (const p of L.possessables) p.tickCommon(dt, this.target === p);
     // hiding places tick themselves; the one being steered was updated above
     for (const p of L.possessables) if (p.spot && p !== this.possessed) p.update(dt, null, L);
+
+    // ---- caught hiding in the very lamp they came to check ----
+    if (L.lampInvestigation && this.state === 'play') {
+      const busted = L.investigating && this.possessed === L.investigating &&
+        L.humans.some(h => h.mode === 'inspect');
+      if (busted) {
+        if (!this.lampBust) {
+          SFX.hurt();
+          this.toast('They are looking right at it — get out!', 1.6);
+          L.investigating.pop = 1;
+        }
+        this.lampBust += dt;
+        this.shake = Math.max(this.shake, 0.25);
+        if (this.lampBust > 1.0) { this.doRelease(); this.spotted(L.humans[0]); }
+      } else {
+        this.lampBust = 0;
+      }
+    }
 
     // ---- housemates: patrol, then look ----
     for (const h of L.humans) {
