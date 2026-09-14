@@ -1,4 +1,4 @@
-# 👻 Ghost Escape — prototype (2 levels)
+# 👻 Ghost Escape — prototype (3 levels)
 
 A cute, cozy little puzzle game for phones. You are a small ghost stuck in a
 nighttime room. Warm light burns you, so you stay in the shadows — and when the
@@ -58,6 +58,27 @@ Being seen restarts the level: they get a surprise "!", the cone flashes, then
 the room resets. Walls block sight, so a doorway you cannot see through is a
 doorway they cannot see through either.
 
+## Level 3 flow — "Hide and Seek"
+
+Same rules as level 2, turned into a timing puzzle. Four zones stacked bottom →
+top, separated by three walls whose doorways alternate right, left, right, so
+the route zig-zags. The housemate walks that same zig-zag the other way and
+crosses your path at every doorway, ending with a look around the exit room
+before turning back.
+
+Four hiding places, one per exposed stretch:
+
+1. **Flower pot** — before the first doorway.
+2. **Cardboard box** — sitting right on their corridor.
+3. **Teddy bear** — just past the left doorway.
+4. **Laundry basket** — below the last doorway, before the run to the exit.
+
+The start corner and the exit room are never patrolled, so you always get a
+quiet moment to watch the route first. Every crossing has a window several
+times longer than the ghost needs (9–18 s of clear time against 0.6–2.4 s of
+travel), but the windows are in different parts of the cycle: sprinting the
+whole route without hiding gets caught from most starting moments.
+
 ## Light hazard
 
 Standing in warm light starts a 1.5 second timer (shown as a bar over the
@@ -76,12 +97,12 @@ Everything lives in one file, `game.js`, split into commented sections:
 | 3 | `Input` — keyboard + invisible drag-to-move (pointer events) |
 | 4 | `Collide` — circle vs AABB / circle |
 | 5 | `LightHazard`, `Possessable` (`FloorLamp`, `ToyCar`, `Fan`, `HideSpot`), `PressurePlate`, `ExitDoor`, `Ghost`, `Human` |
-| 6 | `buildLevel1()`, `buildLevel2()` and the `LEVELS` list |
+| 6 | `buildLevel1()`…`buildLevel3()` and the `LEVELS` list |
 | 7 | `Draw` — procedural room rendering |
 | 8 | `Game` — state machine, main loop, UI glue |
 
 Each level is data in its build function: move a rect, move the furniture. Add a
-level by writing `buildLevel3()` and appending an entry to `LEVELS` — the loop,
+level by writing `buildLevel4()` and appending an entry to `LEVELS` — the loop,
 the UI and the transition card pick it up automatically. Systems are opt-in per
 level: a level with no `plate`/`car`/`lamp` simply omits them, and one with
 `humans` gets patrol, vision cones and detection for free.
@@ -89,7 +110,7 @@ level: a level with no `plate`/`car`/`lamp` simply omits them, and one with
 
 ## Known limitations (prototype)
 
-* Two levels. On the last one `NEXT LEVEL` replays it.
+* Three levels. On the last one `NEXT LEVEL` replays it.
 * One housemate per level; they never search, chase or hear anything yet.
 * Audio is synthesised placeholder blips, no music.
 * Collision is axis-aligned boxes and circles only — no slopes or rotation.

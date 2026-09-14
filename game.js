@@ -1035,6 +1035,111 @@ function buildLevel2() {
   return L;
 }
 
+/* -----------------------------------------------------------------------------
+   LEVEL 3 — "Hide and Seek": timing puzzle, same rules as level 2.
+   Four zones separated by three walls whose doorways alternate left/right, so
+   the route zig-zags. One housemate walks that same zig-zag the other way,
+   crossing the player's path at every doorway. Four hiding places, one per
+   exposed stretch; the start (zone A) and the exit room are never patrolled.
+   ----------------------------------------------------------------------------- */
+
+const L3 = {
+  wallA: { y0: 700, y1: 728, endX: 340 },    // gap on the right  (340..516)
+  wallB: { y0: 470, y1: 498, startX: 190 },  // gap on the left   (24..190)
+  wallC: { y0: 250, y1: 278, endX: 380 }     // gap on the right  (380..516)
+};
+
+function buildLevel3() {
+  const L = {};
+  const A = L3.wallA, B = L3.wallB, C = L3.wallC;
+
+  L.rects = [
+    { x: -60, y: 0, w: 84, h: H },                                  // left wall
+    { x: ROOM.x1, y: 0, w: 84, h: H },                              // right wall
+    { x: 0, y: ROOM.y1, w: W, h: 84 },                              // bottom wall
+    { x: -60, y: -60, w: 60 + DOOR.x0, h: 84 },                     // top wall, left of door
+    { x: DOOR.x1, y: -60, w: W - DOOR.x1 + 60, h: 84 },             // top wall, right of door
+    { x: DOOR.x0, y: -90, w: DOOR.x1 - DOOR.x0, h: 96 },            // the door itself
+    { x: -60, y: A.y0, w: 60 + A.endX, h: A.y1 - A.y0 },
+    { x: B.startX, y: B.y0, w: W - B.startX + 60, h: B.y1 - B.y0 },
+    { x: -60, y: C.y0, w: 60 + C.endX, h: C.y1 - C.y0 },
+
+    // ---- furniture ----
+    { x: 50,  y: 762, w: 140, h: 84,  kind: 'sofa' },       // zone A — the safe start
+    { x: 230, y: 790, w: 96,  h: 56,  kind: 'table' },
+    { x: 360, y: 886, w: 120, h: 40,  kind: 'tv' },
+    { x: 430, y: 500, w: 84,  h: 90,  kind: 'dresser' },    // zone B
+    { x: 40,  y: 520, w: 52,  h: 52,  kind: 'nightstand' },
+    { x: 40,  y: 300, w: 52,  h: 52,  kind: 'nightstand' }, // zone C stays open to cross
+    { x: 40,  y: 60,  w: 150, h: 170, kind: 'bed' },        // zone D — the exit room
+    { x: 330, y: 100, w: 100, h: 64,  kind: 'table' }
+  ];
+
+  L.circles = [
+    { x: 60,  y: 745, r: 20, kind: 'plant', seed: 7 },
+    { x: 486, y: 120, r: 22, kind: 'plant', seed: 8 },
+    { x: 60,  y: 380, r: 20, kind: 'plant', seed: 9 },
+    { x: 486, y: 210, r: 15, kind: 'nightlamp' },
+    // the four hiding places are solid props too
+    { x: 400, y: 760, r: 17, kind: 'hidebase' },
+    { x: 250, y: 650, r: 17, kind: 'hidebase' },
+    { x: 162, y: 420, r: 17, kind: 'hidebase' },
+    { x: 430, y: 420, r: 17, kind: 'hidebase' }
+  ];
+
+  // ---- cozy light only, exactly like level 2: nothing here burns ----
+  L.nightLight = new LightHazard({
+    x: 486, y: 210, dir: -Math.PI / 2, half: 0.62, len: 140,
+    on: true, dangerous: false, nearSafe: 0
+  });
+  L.doorLight = new LightHazard({
+    x: (DOOR.x0 + DOOR.x1) / 2, y: 44, dir: Math.PI / 2, half: 0.62, len: 150,
+    on: true, dangerous: false, nearSafe: 0
+  });
+  L.lights = [L.nightLight, L.doorLight];
+
+  // ---- one hiding place per exposed stretch, in route order ----
+  L.possessables = [
+    new HideSpot(400, 760, 'pot',    'flower pot'),      // before the first doorway
+    new HideSpot(250, 650, 'box',    'cardboard box'),   // on the patrol corridor
+    new HideSpot(162, 420, 'teddy',  'teddy bear'),      // just past the left doorway
+    new HideSpot(430, 420, 'basket', 'laundry basket')   // below the last doorway
+  ];
+
+  // ---- the long patrol: down-right → left → up → right → into the exit room ----
+  L.humans = [new Human({
+    path: [
+      { x: 430, y: 640 },   // A — beside the first doorway
+      { x: 120, y: 600 },   // B — across the lower room
+      { x: 120, y: 380 },   // C — up through the left doorway
+      { x: 430, y: 340 },   // D — back across the upper room
+      { x: 450, y: 180 }    // E — a look around the exit room, then turn back
+    ],
+    speed: 100, pause: 1.15, range: 190, half: 0.46
+  })];
+
+  L.door = new ExitDoor();
+  L.door.locked = false;
+  L.door.open = 1;
+
+  L.rug = { x: 240, y: 872, rx: 130, ry: 56 };
+  L.decor = [
+    { x: 160, y: 876, r: 15, kind: 'cushion', hue: '#5b6bb8' },
+    { x: 322, y: 858, r: 13, kind: 'cushion', hue: '#7a5b9e' },
+    { x: 262, y: 800, r: 11, kind: 'books' },
+    { x: 66,  y: 530, r: 10, kind: 'mug' }
+  ];
+
+  L.dividers = [
+    { y0: A.y0, y1: A.y1, segs: [[ROOM.x0, A.endX]], jambs: [{ x: A.endX, side: -1 }] },
+    { y0: B.y0, y1: B.y1, segs: [[B.startX, ROOM.x1]], jambs: [{ x: B.startX, side: 1 }] },
+    { y0: C.y0, y1: C.y1, segs: [[ROOM.x0, C.endX]], jambs: [{ x: C.endX, side: -1 }] }
+  ];
+
+  finishLevel(L);
+  return L;
+}
+
 /** Shared tail end of every build: defaults, sight blockers, helpers. */
 function finishLevel(L) {
   L.lights = L.lights || [];
@@ -1073,6 +1178,13 @@ const LEVELS = [
     winTitle: 'LEVEL 2 COMPLETE!',
     winText: 'Not a single floorboard creaked.',
     startHint: 'Someone is awake! Hide inside things to stay unseen.'
+  },
+  {
+    name: 'Level 3', subtitle: 'Hide and Seek', objective: 'Time your moves',
+    spawn: { x: 110, y: 900 }, build: buildLevel3,
+    winTitle: 'LEVEL 3 COMPLETE!',
+    winText: 'Four hiding places, one perfectly timed escape.',
+    startHint: 'Watch their route first, then hop from one hiding place to the next.'
   }
 ];
 
@@ -1795,6 +1907,28 @@ const Draw = {
       ctx.beginPath(); ctx.moveTo(0, -1); ctx.lineTo(0, 22); ctx.stroke();
       ctx.fillStyle = 'rgba(255,255,255,0.10)';
       rr(ctx, -18, -5, 6, 24, 3); ctx.fill();
+
+    } else if (o.kind === 'basket') {                     // laundry basket
+      const kg = ctx.createLinearGradient(0, -10, 0, 22);
+      kg.addColorStop(0, '#e0c08a'); kg.addColorStop(1, '#ab8552');
+      ctx.fillStyle = kg;
+      ctx.beginPath();
+      ctx.moveTo(-19, -8); ctx.lineTo(19, -8); ctx.lineTo(15, 22); ctx.lineTo(-15, 22);
+      ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = 'rgba(110,78,40,0.35)'; ctx.lineWidth = 1.6;   // weave
+      for (let i = 0; i < 3; i++) {
+        const y = -1 + i * 8, w = 18 - i * 1.3;
+        ctx.beginPath(); ctx.moveTo(-w, y); ctx.lineTo(w, y); ctx.stroke();
+      }
+      for (let i = -2; i <= 2; i++) {
+        ctx.beginPath(); ctx.moveTo(i * 8, -7); ctx.lineTo(i * 6.4, 21); ctx.stroke();
+      }
+      ctx.fillStyle = '#dfe7ff';                                       // a sock peeking out
+      rr(ctx, 3, -17, 13, 9, 4); ctx.fill();
+      ctx.fillStyle = '#efd3a2';                                       // rim
+      rr(ctx, -21, -13, 42, 9, 4); ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.14)';
+      rr(ctx, -16, -4, 5, 22, 2.5); ctx.fill();
 
     } else {                                              // teddy bear
       ctx.fillStyle = '#b07a52';
