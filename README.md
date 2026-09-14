@@ -1,4 +1,4 @@
-# 👻 Ghost Escape — prototype (5 levels)
+# 👻 Ghost Escape — prototype (6 levels)
 
 A cute, cozy little puzzle game for phones. You are a small ghost stuck in a
 nighttime room. Warm light burns you, so you stay in the shadows — and when the
@@ -101,7 +101,29 @@ floor button down, and a wire along the floor spells out button → gate.
 Being seen resets everything: the box returns home, the gate re-closes, the key
 goes back, and the door locks again.
 
-## Level 5 flow — "Light & Shadow"
+## Level 5 flow — "Distraction"
+
+The housemate stops being only an obstacle. Two objects make a noise on
+command, and anything within earshot comes to look: they walk their own patrol
+line to the nearest waypoint, step across to the source, have a 1.7 s look
+round, then walk back and carry on. They can still see you the whole time —
+a distraction buys space, not invisibility.
+
+Three rooms, and the route zig-zags so that each noise pulls them *backwards*
+along it:
+
+1. Start in the dark corner and possess the **radio**. Press the button: they
+   trudge all the way down to the west corner of the start room to investigate.
+2. Slip out of the room's *east* doorway and cross the empty hallway west,
+   ducking into the **laundry basket** or **flower pot** if they come back.
+3. Go up into the exit room and possess the **alarm clock**. Ringing it turns
+   their long stare across the room into a stare at the west wall.
+4. Cross east behind them, up the last doorway, and west to the door.
+
+Each object has a ~4.5 s cooldown (a thin ring drains around it) so you cannot
+just spam noise, and the button reads `QUIET…` while it recovers.
+
+## Level 6 flow — "Light & Shadow"
 
 The lighting itself is the puzzle. Lit floor is dangerous at a distance — the
 housemate sees 260px into it — while in darkness they only notice you inside
@@ -142,13 +164,13 @@ Everything lives in one file, `game.js`, split into commented sections:
 | 2 | `Particles` — one flat pool |
 | 3 | `Input` — keyboard + invisible drag-to-move (pointer events) |
 | 4 | `Collide` — circle vs AABB / circle |
-| 5 | `LightHazard`, `Possessable` (`FloorLamp`, `RotatingLamp`, `ToyCar`, `Fan`, `HideSpot`, `PushBox`), `PressurePlate`, `Gate`, `KeyPickup`, `ExitDoor`, `Ghost`, `Human` |
-| 6 | `buildLevel1()`…`buildLevel5()` and the `LEVELS` list |
+| 5 | `LightHazard`, `Possessable` (`FloorLamp`, `RotatingLamp`, `ToyCar`, `Fan`, `HideSpot`, `PushBox`, `DistractionObject`), `PressurePlate`, `Gate`, `KeyPickup`, `ExitDoor`, `Ghost`, `Human` |
+| 6 | `buildLevel1()`…`buildLevel6()` and the `LEVELS` list |
 | 7 | `Draw` — procedural room rendering |
 | 8 | `Game` — state machine, main loop, UI glue |
 
 Each level is data in its build function: move a rect, move the furniture. Add a
-level by writing `buildLevel6()` and appending an entry to `LEVELS` — the loop,
+level by writing `buildLevel7()` and appending an entry to `LEVELS` — the loop,
 the UI and the transition card pick it up automatically. Systems are opt-in per
 level: a level with no `plate`/`car`/`lamp` simply omits them, and one with
 `humans` gets patrol, vision cones and detection for free.
@@ -156,7 +178,7 @@ level: a level with no `plate`/`car`/`lamp` simply omits them, and one with
 
 ## Known limitations (prototype)
 
-* Five levels. On the last one `NEXT LEVEL` replays it.
+* Six levels. Finishing the last one shows a PROTOTYPE COMPLETE screen.
 * One housemate per level; they never search, chase or hear anything yet.
 * Audio is synthesised placeholder blips, no music.
 * Collision is axis-aligned boxes and circles only — no slopes or rotation.

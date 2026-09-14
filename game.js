@@ -137,6 +137,8 @@ const SFX = {
   unlock()   { [523, 659, 784].forEach((f, i) => this.tone(f, 0.3, 'sine', 0.3, 0, i * 0.09)); this.noise(0.25, 0.12); },
   hurt()     { this.tone(180, 0.3, 'sawtooth', 0.16, 90); },
   key()      { [784, 1046, 1318].forEach((f, i) => this.tone(f, 0.26, 'triangle', 0.26, 0, i * 0.06)); },
+  radio()    { [523, 659, 784, 659].forEach((f, i) => this.tone(f, 0.18, 'square', 0.1, 0, i * 0.12)); this.noise(0.18, 0.05); },
+  alarm()    { for (let i = 0; i < 4; i++) { this.tone(1046, 0.07, 'square', 0.14, 0, i * 0.12); this.tone(1318, 0.07, 'square', 0.12, 0, i * 0.12 + 0.06); } },
   locked()   { this.tone(150, 0.11, 'square', 0.13); this.tone(115, 0.15, 'square', 0.11, 0, 0.09); },
   fail()     { this.tone(330, 0.5, 'sine', 0.3, 110); this.noise(0.4, 0.18); },
   win()      { [523, 659, 784, 1046].forEach((f, i) => this.tone(f, 0.45, 'sine', 0.32, 0, i * 0.11)); },
@@ -580,6 +582,51 @@ class FloorLamp extends Possessable {
 }
 
 /**
+ * Something that makes a noise on command: a radio, an alarm clock. Possess it,
+ * press the big button, and every housemate within earshot comes to look.
+ * `anchor` is the patrol waypoint they route through, `spot` where they stand.
+ */
+class DistractionObject extends Possessable {
+  constructor(x, y, kind, o) {
+    super({ x, y, r: 24, name: kind, kind });
+    Object.assign(this, {
+      anchor: 0, spot: [x, y + 40], hearing: 480, cooldown: 4.5, label: kind
+    }, o || {});
+    this.noisy = true;
+    this.cool = 0;        // seconds left before it can be used again
+    this.buzz = 0;        // little vibration
+    this.ping = 0;        // expanding sound rings
+  }
+  actionLabel() {
+    if (this.cool > 0) return 'QUIET…';
+    return this.kind === 'radio' ? 'PLAY' : 'RING';
+  }
+  /** Returns true when it actually made a noise. */
+  activate() {
+    if (this.cool > 0) return false;
+    this.cool = this.cooldown;
+    this.buzz = 1;
+    this.ping = 1;
+    this.pop = 1;
+    if (this.kind === 'radio') SFX.radio(); else SFX.alarm();
+    Particles.spawn({ x: this.x, y: this.y - 6, vx: 0, vy: 0, life: 0.7, size: 14, color: '#ffe6a0', shape: 'ring' });
+    for (let i = 0; i < 8; i++) {
+      Particles.spawn({
+        x: this.x + rand(-12, 12), y: this.y - 10,
+        vx: rand(-30, 30), vy: rand(-70, -25),
+        life: rand(0.4, 0.8), size: rand(2, 4), color: '#ffeebb', shape: 'star', spin: rand(-6, 6)
+      });
+    }
+    return true;
+  }
+  update(dt) {
+    this.cool = Math.max(0, this.cool - dt);
+    this.buzz = Math.max(0, this.buzz - dt * 2.2);
+    this.ping = Math.max(0, this.ping - dt * 0.9);
+  }
+}
+
+/**
  * A lamp whose beam the player aims. Possess it, then drag (or press A/D) to
  * sweep the light between two clamped angles — no spinning, no extra buttons.
  */
@@ -978,6 +1025,66 @@ class Human {
     this.lookX = x; this.lookY = y;
   }
 
+  /**
+   * Go and look at a noise. They walk their own patrol line as far as `anchor`
+   * (so they can never cut a corner through a wall), step across to `spot`,
+   * have a look round, then walk back and carry on where they left off.
+   */
+  investigate(anchor, spot, sx, sy) {
+    if (this.mode) return false;                 // already busy having a look
+    this.mode = 'route';
+    this.invAnchor = clamp(anchor | 0, 0, this.path.length - 1);
+    this.invSpot = spot;
+    this.lookX = sx; this.lookY = sy;
+    this.curious = 1.0;                          // reuse the "?" bubble
+    this.paused = 0;
+    this.inspectT = 0;
+    return true;
+  }
+
+  /** One frame of the go-look-come-back routine. */
+  investigateStep(dt) {
+    const step = (tx, ty, rate) => {             // walk straight at something
+      const dx = tx - this.x, dy = ty - this.y;
+      const d = Math.hypot(dx, dy);
+      if (d < 3) return true;
+      const move = Math.min(this.speed * dt, d);
+      this.x += (dx / d) * move;
+      this.y += (dy / d) * move;
+      this.bob += move * 0.09;
+      this.faceTowards(tx, ty, dt, rate || 4.5);
+      return false;
+    };
+
+    if (this.mode === 'route') {                 // along the patrol to the anchor
+      const n = this.path[this.target];
+      if (step(n.x, n.y)) {
+        if (this.target === this.invAnchor) this.mode = 'toSound';
+        else this.target += (this.invAnchor > this.target) ? 1 : -1;
+      }
+    } else if (this.mode === 'toSound') {        // the short hop to the spot
+      if (step(this.invSpot[0], this.invSpot[1])) {
+        this.mode = 'inspect';
+        this.inspectT = 1.7;
+      }
+    } else if (this.mode === 'inspect') {        // a look round, then done
+      this.inspectT -= dt;
+      const base = Math.atan2(this.lookY - this.y, this.lookX - this.x);
+      const sway = Math.sin(this.inspectT * 3.4) * 0.45;
+      this.angle += clamp(angDiff(base + sway, this.angle), -3.2 * dt, 3.2 * dt);
+      if (this.inspectT <= 0) this.mode = 'back';
+    } else if (this.mode === 'back') {           // back to the patrol line
+      const a = this.path[this.invAnchor];
+      if (step(a.x, a.y)) {
+        this.mode = null;
+        this.target = this.invAnchor;
+        let next = this.target + this.step;
+        if (next >= this.path.length || next < 0) { this.step *= -1; next = this.target + this.step; }
+        this.target = clamp(next, 0, this.path.length - 1);
+      }
+    }
+  }
+
   faceTowards(ax, ay, dt, rate) {
     const want = Math.atan2(ay - this.y, ax - this.x);
     this.angle += clamp(angDiff(want, this.angle), -rate * dt, rate * dt);
@@ -987,6 +1094,11 @@ class Human {
     this.t += dt;
     const n = this.path[this.target];
 
+    if (this.mode) {                             // off investigating a noise
+      this.curious = Math.max(0, this.curious - dt);
+      this.investigateStep(dt);
+      return;
+    }
     if (this.curious > 0) {                      // stop and look at whatever changed
       this.curious -= dt;
       this.faceTowards(this.lookX, this.lookY, dt, 3.4);
@@ -1438,21 +1550,137 @@ function buildLevel4() {
 }
 
 /* -----------------------------------------------------------------------------
-   LEVEL 5 — "Light & Shadow": the player rearranges the lighting itself.
+   LEVEL 5 — "Distraction": the housemate becomes part of the puzzle.
+   The route zig-zags west → east → west, and each crossing is opened by making
+   a noise at the opposite end: the radio pins them in the west hallway, the
+   alarm clock pulls them into the east corner of the exit room.
+   ----------------------------------------------------------------------------- */
+
+const L5 = {
+  // start room has two doorways: the ghost leaves by the east one while the
+  // housemate is lured down to the west one
+  wallA: { y0: 640, y1: 668, x0: 150, x1: 380 },
+  wallB: { y0: 312, y1: 340, startX: 180 },   // hallway -> exit room, doorway west
+  wallC: { y0: 150, y1: 178, endX: 360 }      // exit room -> door strip, doorway east
+};
+
+function buildLevel5() {
+  const L = {};
+  const A = L5.wallA, B = L5.wallB, C = L5.wallC;
+
+  L.rects = [
+    { x: -60, y: 0, w: 84, h: H },                                  // left wall
+    { x: ROOM.x1, y: 0, w: 84, h: H },                              // right wall
+    { x: 0, y: ROOM.y1, w: W, h: 84 },                              // bottom wall
+    { x: -60, y: -60, w: 60 + DOOR.x0, h: 84 },                     // top wall, left of door
+    { x: DOOR.x1, y: -60, w: W - DOOR.x1 + 60, h: 84 },             // top wall, right of door
+    { x: DOOR.x0, y: -90, w: DOOR.x1 - DOOR.x0, h: 96 },            // the door itself
+    { x: A.x0, y: A.y0, w: A.x1 - A.x0, h: A.y1 - A.y0 },           // wall A (two doorways)
+    { x: B.startX, y: B.y0, w: W - B.startX + 60, h: B.y1 - B.y0 }, // wall B
+    { x: -60, y: C.y0, w: 60 + C.endX, h: C.y1 - C.y0 },            // wall C
+
+    // ---- furniture ----
+    { x: 180, y: 690, w: 150, h: 80,  kind: 'sofa' },       // start room
+    { x: 200, y: 850, w: 96,  h: 50,  kind: 'table' },
+    { x: 390, y: 880, w: 110, h: 40,  kind: 'tv' },
+    { x: 230, y: 350, w: 84,  h: 80,  kind: 'dresser' },    // hallway
+    { x: 400, y: 180, w: 56,  h: 56,  kind: 'nightstand' }, // exit room
+    { x: 60,  y: 44,  w: 96,  h: 56,  kind: 'table' }       // door strip
+  ];
+
+  L.circles = [
+    { x: 486, y: 760, r: 22, kind: 'plant', seed: 16 },
+    { x: 60,  y: 560, r: 20, kind: 'plant', seed: 17 },
+    { x: 486, y: 110, r: 20, kind: 'plant', seed: 18 },
+    { x: 170, y: 880, r: 17, kind: 'hidebase' },
+    { x: 430, y: 600, r: 17, kind: 'hidebase' },
+    { x: 148, y: 430, r: 17, kind: 'hidebase' },
+    { x: 300, y: 288, r: 17, kind: 'hidebase' },
+    { x: 80,  y: 740, r: 15, kind: 'noisebase' },           // radio
+    { x: 70,  y: 250, r: 15, kind: 'noisebase' }            // alarm clock
+  ];
+
+  L.doorLight = new LightHazard({
+    x: (DOOR.x0 + DOOR.x1) / 2, y: 44, dir: Math.PI / 2, half: 0.62, len: 120,
+    on: true, dangerous: false, nearSafe: 0
+  });
+  L.nightLight = new LightHazard({
+    x: 486, y: 806, dir: -Math.PI / 2, half: 0.62, len: 120,
+    on: true, dangerous: false, nearSafe: 0
+  });
+  L.lights = [L.doorLight, L.nightLight];
+
+  // ---- two things to make a racket with, each luring them backwards ----
+  // radio: drags them all the way down to the start room's west corner while
+  // the ghost slips out of the east doorway and crosses the empty hallway
+  L.radio = new DistractionObject(80, 740, 'radio', {
+    anchor: 1, spot: [104, 700], hearing: 560
+  });
+  // clock: turns their long stare across the exit room into a stare at the
+  // west wall, so the ghost can cross east behind them
+  L.clock = new DistractionObject(70, 250, 'clock', {
+    anchor: 2, spot: [108, 252], hearing: 560
+  });
+
+  L.possessables = [
+    new HideSpot(170, 880, 'teddy',  'teddy bear'),    // start room corner
+    new HideSpot(430, 600, 'basket', 'laundry basket'),// hallway east, after the doorway
+    new HideSpot(148, 430, 'pot',    'flower pot'),    // hallway west, beside the doorway
+    new HideSpot(300, 288, 'box',    'cardboard box'), // exit room, beside the crossing
+    L.radio,
+    L.clock
+  ];
+
+  L.door = new ExitDoor();
+  L.door.locked = false;
+  L.door.open = 1;
+
+  // they stare down the hallway from one end and across the exit room from the
+  // other — exactly the two stretches the ghost has to cross
+  L.humans = [new Human({
+    path: [
+      { x: 440, y: 520, face: [140, 545] },   // A — hallway east, looking west
+      { x: 150, y: 480 },                     // B — hallway west
+      { x: 170, y: 250, face: [460, 262] }    // C — exit room, looking east
+    ],
+    speed: 92, pause: 2.0, range: 195, half: 0.46
+  })];
+
+  L.rug = { x: 250, y: 800, rx: 120, ry: 52 };
+  L.decor = [
+    { x: 300, y: 812, r: 13, kind: 'cushion', hue: '#5b6bb8' },
+    { x: 210, y: 786, r: 12, kind: 'cushion', hue: '#7a5b9e' },
+    { x: 240, y: 862, r: 11, kind: 'books' },
+    { x: 96,  y: 66,  r: 10, kind: 'mug' }
+  ];
+
+  L.dividers = [
+    { y0: A.y0, y1: A.y1, segs: [[A.x0, A.x1]],
+      jambs: [{ x: A.x0, side: 1 }, { x: A.x1, side: -1 }] },
+    { y0: B.y0, y1: B.y1, segs: [[B.startX, ROOM.x1]], jambs: [{ x: B.startX, side: 1 }] },
+    { y0: C.y0, y1: C.y1, segs: [[ROOM.x0, C.endX]], jambs: [{ x: C.endX, side: -1 }] }
+  ];
+
+  finishLevel(L);
+  return L;
+}
+
+/* -----------------------------------------------------------------------------
+   LEVEL 6 — "Light & Shadow": the player rearranges the lighting itself.
    Lit floor is dangerous at a distance (the housemate sees 200px into it) while
    darkness hides you until they are almost on top of you (72px). Two lamps are
    controllable: a standing lamp that switches off, and a table lamp whose beam
    you aim between the two routes past the final wall.
    ----------------------------------------------------------------------------- */
 
-const L5 = {
+const L6 = {
   wallA: { y0: 560, y1: 588, endX: 300 },                 // doorway on the right
   wallB: { y0: 300, y1: 328, gx0: 200, gx1: 330 }         // doorway in the middle
 };
 
-function buildLevel5() {
+function buildLevel6() {
   const L = {};
-  const A = L5.wallA, B = L5.wallB;
+  const A = L6.wallA, B = L6.wallB;
 
   L.rects = [
     { x: -60, y: 0, w: 84, h: H },                                  // left wall
@@ -1575,6 +1803,15 @@ function finishLevel(L) {
   L.lampChanged = function (x, y) {
     for (const h of this.humans) if (dist(h.x, h.y, x, y) < 250) h.startle(x, y);
   };
+  /** Something made a noise: everyone in earshot goes to have a look. */
+  L.makeNoise = function (obj) {
+    let heard = false;
+    for (const h of this.humans) {
+      if (dist(h.x, h.y, obj.x, obj.y) > obj.hearing) continue;
+      if (h.investigate(obj.anchor, obj.spot, obj.x, obj.y)) heard = true;
+    }
+    return heard;
+  };
   /** Is the ghost in somebody's view right now? */
   L.seenBy = function (x, y) {
     for (const h of this.humans) if (h.sees(x, y, this)) return h;
@@ -1613,11 +1850,19 @@ const LEVELS = [
     startHint: 'The exit is locked. Something heavy could hold that floor button down...'
   },
   {
-    name: 'Level 5', subtitle: 'Light & Shadow', objective: 'Make your own darkness',
-    spawn: { x: 110, y: 870 }, build: buildLevel5,
+    name: 'Level 5', subtitle: 'Distraction', objective: 'Make them look away',
+    spawn: { x: 100, y: 890 }, build: buildLevel5,
     winTitle: 'LEVEL 5 COMPLETE!',
-    winText: 'Lights out, shadows arranged, ghost gone.',
-    startHint: 'They see far in the light — but barely at all in the dark.'
+    winText: 'Two noises, one very confused housemate.',
+    startHint: 'Possess the radio or the clock and make a noise — they will go and look.'
+  },
+  {
+    name: 'Level 6', subtitle: 'Light & Shadow', objective: 'Make your own darkness',
+    spawn: { x: 110, y: 870 }, build: buildLevel6,
+    winTitle: 'PROTOTYPE COMPLETE',
+    winText: 'Six levels, one very slippery ghost. That is everything for now.',
+    startHint: 'They see far in the light — but barely at all in the dark.',
+    final: true
   }
 ];
 
@@ -2058,6 +2303,98 @@ const Draw = {
     ctx.restore();
 
     if (lamp.glow > 0.02) this.possessAura(ctx, lamp.x, lamp.y - 50, 46, lamp.glow, time);
+  },
+
+  /** Radio / alarm clock: possess it, press the button, and it makes a racket. */
+  distraction(ctx, o, time) {
+    this.highlightRing(ctx, o, time);
+    // sound rings rolling outwards when it has just gone off
+    if (o.ping > 0.02) {
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      for (let i = 0; i < 3; i++) {
+        const t = clamp(o.ping - i * 0.18, 0, 1);
+        if (t <= 0) continue;
+        ctx.globalAlpha = t * 0.5;
+        ctx.strokeStyle = '#ffe6a0';
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        ctx.ellipse(o.x, o.y - 4, (1 - t) * 70 + 16, ((1 - t) * 70 + 16) * 0.62, 0, 0, TAU);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    const shake = o.buzz > 0 ? Math.sin(time * 46) * 2.4 * o.buzz : 0;
+    softShadow(ctx, o.x, o.y + 10, 22, 9, 0.45);
+    ctx.save();
+    ctx.translate(o.x + shake, o.y + 6);
+    ctx.scale(1 + o.pop * 0.12, 1 + o.pop * 0.12);
+    ctx.translate(0, -6);
+
+    if (o.kind === 'radio') {
+      const bg = ctx.createLinearGradient(0, -16, 0, 14);
+      bg.addColorStop(0, '#9a6f4e'); bg.addColorStop(1, '#6d4a33');
+      ctx.fillStyle = bg;
+      rr(ctx, -22, -16, 44, 30, 6); ctx.fill();
+      ctx.fillStyle = '#d9c39c';                                  // speaker grille
+      ctx.beginPath(); ctx.arc(-8, -1, 8.5, 0, TAU); ctx.fill();
+      ctx.fillStyle = 'rgba(70,45,28,0.55)';
+      for (let i = -2; i <= 2; i++) { rr(ctx, -15, -3 + i * 3, 14, 1.6, 0.8); ctx.fill(); }
+      ctx.fillStyle = '#2c2440';                                  // dial window
+      rr(ctx, 5, -10, 14, 8, 2); ctx.fill();
+      ctx.fillStyle = o.cool > 0 ? '#6b7aa8' : '#9dffc8';
+      rr(ctx, 7, -8, 3, 4, 1); ctx.fill();
+      ctx.fillStyle = '#d9c39c';                                  // knobs
+      ctx.beginPath(); ctx.arc(9, 5, 3.4, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(17, 5, 3.4, 0, TAU); ctx.fill();
+      ctx.strokeStyle = '#d9c39c'; ctx.lineWidth = 2; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(16, -16); ctx.lineTo(22, -28); ctx.stroke();  // aerial
+
+    } else {                                                      // alarm clock
+      ctx.fillStyle = '#cfd8ec';                                  // metal bells
+      ctx.beginPath(); ctx.arc(-12, -16, 5.5, Math.PI * 0.9, Math.PI * 2.2); ctx.fill();
+      ctx.beginPath(); ctx.arc(12, -16, 5.5, Math.PI * 0.8, Math.PI * 2.1); ctx.fill();
+      ctx.strokeStyle = '#cfd8ec'; ctx.lineWidth = 2.4; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(-7, -16); ctx.lineTo(7, -16); ctx.stroke();   // bar
+      ctx.strokeStyle = '#c4585e'; ctx.lineWidth = 3; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(-9, 10); ctx.lineTo(-14, 16); ctx.stroke();   // feet
+      ctx.beginPath(); ctx.moveTo(9, 10); ctx.lineTo(14, 16); ctx.stroke();
+      const cg = ctx.createLinearGradient(0, -14, 0, 12);
+      cg.addColorStop(0, '#e4737a'); cg.addColorStop(1, '#b4484f');
+      ctx.fillStyle = cg;
+      ctx.beginPath(); ctx.arc(0, -2, 15, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#fdf2e4';                                  // face
+      ctx.beginPath(); ctx.arc(0, -2, 11.5, 0, TAU); ctx.fill();
+      ctx.strokeStyle = 'rgba(60,40,34,0.35)'; ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.arc(0, -2, 11.5, 0, TAU); ctx.stroke();
+      ctx.fillStyle = 'rgba(60,40,34,0.5)';                       // hour ticks
+      for (let i = 0; i < 4; i++) {
+        const a = i * Math.PI / 2;
+        ctx.beginPath(); ctx.arc(Math.cos(a) * 8.4, -2 + Math.sin(a) * 8.4, 1.1, 0, TAU); ctx.fill();
+      }
+      ctx.strokeStyle = '#3a2a22'; ctx.lineWidth = 1.8; ctx.lineCap = 'round';
+      const hh = o.cool > 0 ? time * 0.6 : -1.1;
+      ctx.beginPath(); ctx.moveTo(0, -2); ctx.lineTo(Math.cos(hh) * 6, -2 + Math.sin(hh) * 6); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, -2); ctx.lineTo(0, -9); ctx.stroke();
+      ctx.fillStyle = '#3a2a22';
+      ctx.beginPath(); ctx.arc(0, -2, 1.6, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+
+    // cooling down: a thin ring quietly draining away
+    if (o.cool > 0) {
+      const t = o.cool / o.cooldown;
+      ctx.save();
+      ctx.globalAlpha = 0.45;
+      ctx.strokeStyle = '#9fb2f0';
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.arc(o.x, o.y + 2, 26, -Math.PI / 2, -Math.PI / 2 + TAU * t);
+      ctx.stroke();
+      ctx.restore();
+    }
+    if (o.glow > 0.02) this.possessAura(ctx, o.x, o.y - 4, 34, o.glow, time);
   },
 
   /** The aimable table lamp: a head that swings, plus a dial while you hold it. */
@@ -2759,11 +3096,11 @@ const Draw = {
       ctx.beginPath(); ctx.ellipse(0, 0, 11, 12, 0, 0, TAU); ctx.fill();
       ctx.beginPath(); ctx.moveTo(-4, 9); ctx.lineTo(4, 9); ctx.lineTo(0, 15); ctx.closePath(); ctx.fill();
       if (q) {
-        ctx.strokeStyle = '#5b86c9'; ctx.lineWidth = 2.6; ctx.lineCap = 'round';
-        ctx.beginPath(); ctx.arc(0, -3.5, 3.4, Math.PI * 0.95, Math.PI * 0.25); ctx.stroke();
-        ctx.beginPath(); ctx.moveTo(1.6, 0.4); ctx.lineTo(0, 2.6); ctx.stroke();
-        ctx.fillStyle = '#5b86c9';
-        ctx.beginPath(); ctx.arc(0, 6, 1.9, 0, TAU); ctx.fill();
+        ctx.strokeStyle = '#3663ad'; ctx.lineWidth = 3.2; ctx.lineCap = 'round';
+        ctx.beginPath(); ctx.arc(0, -3.5, 3.6, Math.PI * 0.95, Math.PI * 0.22); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(2.2, 0.2); ctx.lineTo(0.2, 2.8); ctx.stroke();
+        ctx.fillStyle = '#3663ad';
+        ctx.beginPath(); ctx.arc(0.2, 6.2, 2.1, 0, TAU); ctx.fill();
       } else {
         ctx.fillStyle = '#e8576b';
         rr(ctx, -2, -7, 4, 9, 2); ctx.fill();
@@ -2990,8 +3327,8 @@ const Game = {
       if (this.levelIndex < LEVELS.length - 1) {
         this.goToLevel(this.levelIndex + 1);
       } else {
-        this.hideOverlay(); this.reset();
-        this.toast('More levels coming soon! Here is this one again.', 3.2);
+        this.pickLevel(0);                       // prototype finished: play again
+        this.toast('From the top!', 2.4);
       }
     });
     // ---- level picker ----
@@ -3128,6 +3465,7 @@ const Game = {
     if (p.name === 'lamp')      this.hint('h-lamp-in', 'Now press TURN OFF to kill the light');
     else if (p.name === 'car')  this.hint('h-car-in', 'Drive onto the glowing plate');
     else if (p.name === 'fan')  this.hint('h-fan-in', 'Spin it up! (not needed to escape)');
+    else if (p.noisy)           this.hint('h-noise-in', 'Press the button to make a racket', 3.2);
     else if (p.rotatable)       this.hint('h-rotate', 'Drag left / right to aim the light', 3.2);
     else if (p.spot)            this.hint('h-hide-in', 'Nobody can see you in there. Wait, then RELEASE.', 3.2);
   },
@@ -3160,9 +3498,15 @@ const Game = {
     const p = this.possessed;
     if (p) {
       if (p.actionLabel()) {
-        p.activate();                        // lamp / fan toggle
+        const did = p.activate();            // lamp / fan toggle, radio, clock...
         // a lamp clicking off is the kind of thing a housemate notices
         if (p.light && this.level.lampChanged) this.level.lampChanged(p.x, p.y);
+        // ...and a noise sends them over to look
+        if (p.noisy && did && this.level.makeNoise) {
+          this.level.makeNoise(p);
+          this.shake = 0.2;
+          this.hint('h-noise', 'They heard that — get moving while they look', 3.2);
+        }
       } else {
         this.doRelease();                    // car / hiding spot / aimed lamp
       }
@@ -3236,7 +3580,9 @@ const Game = {
     }
     UI.objective.textContent = 'Escaped!';
     UI.objective.classList.add('done');
-    if (this.levelIndex < LEVELS.length - 1) UI.btnNext.textContent = 'NEXT LEVEL';
+    const last = this.levelIndex >= LEVELS.length - 1;
+    UI.btnNext.textContent = last ? 'PLAY AGAIN' : 'NEXT LEVEL';
+    UI.btnAgain.textContent = last ? 'REPLAY LEVEL' : 'RESTART';
   },
 
   /* ---------------- per-frame update ---------------- */
@@ -3288,6 +3634,7 @@ const Game = {
     // aimable lamps: the drag steers the beam while the ghost is inside one
     for (const p of L.possessables) {
       if (p.rotatable) p.update(dt, p === this.possessed ? input : null);
+      else if (p.noisy) p.update(dt);          // cooldown + buzz + sound rings
     }
     for (const l of L.lights) l.update(dt, this.time);
 
@@ -3483,6 +3830,7 @@ const Game = {
     if (L.lamp) Draw.lamp(ctx, L.lamp, this.time);
     if (L.fan) Draw.fan(ctx, L.fan, this.time);
     for (const p of L.possessables) if (p.rotatable) Draw.aimLamp(ctx, p, this.time);
+    for (const p of L.possessables) if (p.noisy) Draw.distraction(ctx, p, this.time);
     if (L.car) Draw.car(ctx, L.car, this.time);
     if (L.key) Draw.keyPickup(ctx, L.key, this.time);
     for (const o of L.possessables) if (o.spot) Draw.hideSpot(ctx, o, this.time);
