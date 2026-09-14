@@ -24,11 +24,18 @@
           <div class="level-title">Level 1</div>
           <div class="level-sub" id="objective">Reach the exit</div>
         </div>
-        <button id="btn-restart" class="icon-btn" aria-label="Restart level">
-          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
-            <path d="M12 5V2L7 6l5 4V7a5 5 0 1 1-5 5H5a7 7 0 1 0 7-7z" fill="currentColor"/>
-          </svg>
-        </button>
+        <div class="top-buttons">
+          <button id="btn-levels" class="icon-btn" aria-label="Select level">
+            <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+              <path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z" fill="currentColor"/>
+            </svg>
+          </button>
+          <button id="btn-restart" class="icon-btn" aria-label="Restart level">
+            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+              <path d="M12 5V2L7 6l5 4V7a5 5 0 1 1-5 5H5a7 7 0 1 0 7-7z" fill="currentColor"/>
+            </svg>
+          </button>
+        </div>
       </div>
 
       <div id="toast"></div>
@@ -49,6 +56,7 @@
         <div class="panel-buttons">
           <button id="btn-next" class="menu-btn primary">NEXT LEVEL</button>
           <button id="btn-again" class="menu-btn">RESTART</button>
+          <button id="btn-ov-levels" class="menu-btn">SELECT LEVEL</button>
         </div>
       </div>
     </div>
@@ -63,7 +71,22 @@
           <strong>Possess</strong> objects to change the room.
         </p>
         <div class="intro-keys">Drag to move · WASD / Arrows &nbsp;|&nbsp; Action: E / Space</div>
-        <button id="btn-start" class="menu-btn primary">PLAY</button>
+        <div class="panel-buttons">
+          <button id="btn-start" class="menu-btn primary">PLAY</button>
+          <button id="btn-intro-levels" class="menu-btn">SELECT LEVEL</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- level picker (handy for testing; built from the LEVELS list) -->
+    <div id="levels" class="hidden">
+      <div class="panel">
+        <h1>SELECT LEVEL</h1>
+        <p>Jump straight to any level.</p>
+        <div id="level-grid"></div>
+        <div class="panel-buttons">
+          <button id="btn-levels-close" class="menu-btn">BACK</button>
+        </div>
       </div>
     </div>
 

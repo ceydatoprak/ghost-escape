@@ -94,6 +94,51 @@ html,body{
 }
 .icon-btn:active{ transform:scale(.9); background:rgba(40,60,120,.85); }
 
+.top-buttons{ display:flex; gap:8px; align-items:flex-start; }
+
+/* ================= Level picker ================= */
+#levels{
+  position:absolute; inset:0;
+  display:flex; align-items:center; justify-content:center;
+  background:radial-gradient(60% 50% at 50% 45%, rgba(20,32,80,.74), rgba(4,6,16,.92));
+  backdrop-filter:blur(3px); -webkit-backdrop-filter:blur(3px);
+  z-index:7;
+  animation:fadeIn .25s ease both;
+}
+#levels .panel{ width:84%; }
+#level-grid{
+  display:grid;
+  grid-template-columns:repeat(2, minmax(0,1fr));
+  gap:9px;
+  margin-bottom:16px;
+}
+.level-card{
+  cursor:pointer;
+  font-family:var(--font);
+  display:flex; flex-direction:column; align-items:center; justify-content:center;
+  gap:2px;
+  min-height:clamp(54px,15vw,68px);
+  padding:8px 6px;
+  border-radius:14px;
+  color:#dfeeff;
+  background:rgba(60,84,160,.4);
+  border:1px solid rgba(160,200,255,.28);
+  transition:transform .1s, background .2s, border-color .2s;
+}
+.level-card:active{ transform:scale(.94); }
+.level-card.current{
+  background:linear-gradient(180deg, rgba(140,205,255,.9), rgba(87,166,238,.9));
+  color:#06203a;
+  border-color:transparent;
+  box-shadow:0 0 20px rgba(110,200,255,.45);
+}
+.level-card .n{ font-size:clamp(16px,4.6vw,21px); font-weight:800; letter-spacing:.04em; line-height:1.1; }
+.level-card .sub{
+  font-size:clamp(8px,2.3vw,10px);
+  letter-spacing:.12em; text-transform:uppercase;
+  opacity:.72; line-height:1.2; text-align:center;
+}
+
 /* ================= Toast hints ================= */
 #toast{
   position:absolute; left:50%; top:16%;

@@ -136,6 +136,8 @@ const SFX = {
   plate()    { this.tone(392, 0.14, 'triangle', 0.3); this.tone(587, 0.22, 'triangle', 0.26, 0, 0.09); },
   unlock()   { [523, 659, 784].forEach((f, i) => this.tone(f, 0.3, 'sine', 0.3, 0, i * 0.09)); this.noise(0.25, 0.12); },
   hurt()     { this.tone(180, 0.3, 'sawtooth', 0.16, 90); },
+  key()      { [784, 1046, 1318].forEach((f, i) => this.tone(f, 0.26, 'triangle', 0.26, 0, i * 0.06)); },
+  locked()   { this.tone(150, 0.11, 'square', 0.13); this.tone(115, 0.15, 'square', 0.11, 0, 0.09); },
   fail()     { this.tone(330, 0.5, 'sine', 0.3, 110); this.noise(0.4, 0.18); },
   win()      { [523, 659, 784, 1046].forEach((f, i) => this.tone(f, 0.45, 'sine', 0.32, 0, i * 0.11)); },
   step()     { this.tone(rand(600, 900), 0.05, 'sine', 0.05); }
@@ -251,6 +253,7 @@ const Input = {
       if (!this.keys[k]) {
         if (k === 'e' || k === ' ' || k === 'enter') this.actionEdge = true;
         if (k === 'q' || k === 'escape') this.releaseEdge = true;
+        if (k >= '1' && k <= '9') this.levelKey = +k;      // quick level jump
       }
       this.keys[k] = true;
       if ([' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) e.preventDefault();
@@ -371,7 +374,8 @@ const Input = {
 
   takeAction()  { const v = this.actionEdge;  this.actionEdge = false;  return v; },
   takeRelease() { const v = this.releaseEdge; this.releaseEdge = false; return v; },
-  takeTap()     { const v = this.tapPoint;    this.tapPoint = null;     return v; }
+  takeTap()     { const v = this.tapPoint;    this.tapPoint = null;     return v; },
+  takeLevelKey(){ const v = this.levelKey;    this.levelKey = 0;        return v; }
 };
 
 /* =============================================================================
@@ -419,9 +423,16 @@ const Collide = {
   /** Resolve a moving circle against the whole level. Returns true if it hit. */
   resolve(body, level) {
     let hit = false;
+    const movers = level.movables;
     for (let pass = 0; pass < 2; pass++) {
-      for (const r of level.rects)   if (this.circleRect(body, r))   hit = true;
+      for (const r of level.rects) {
+        if (r.disabled) continue;                       // an opened gate stops colliding
+        if (this.circleRect(body, r)) hit = true;
+      }
       for (const o of level.circles) if (this.circleCircle(body, o)) hit = true;
+      if (movers) {                                     // push-able props are solid too
+        for (const m of movers) if (m !== body && this.circleCircle(body, m)) hit = true;
+      }
     }
     return hit;
   }
@@ -459,6 +470,7 @@ function sightLimit(level, ox, oy, ang, maxLen) {
   const dx = Math.cos(ang), dy = Math.sin(ang);
   let best = maxLen;
   for (const r of blockers) {
+    if (r.disabled) continue;                           // an opened gate no longer blocks
     const t = rayRectT(ox, oy, dx, dy, r, maxLen);
     if (t < best) best = t;
   }
@@ -475,6 +487,8 @@ class LightHazard {
     Object.assign(this, {
       x: 0, y: 0, dir: -Math.PI / 2, half: 0.85, len: 300,
       on: true, dangerous: true,
+      bright: false,      // does this light make the ghost easy to spot?
+      occluded: false,    // should walls cast shadows out of it?
       nearSafe: 26,       // the bulb itself is not a kill zone
       shaft: null,        // optional occluder: light only escapes through a gap
       fade: 1, flicker: 0
@@ -489,16 +503,34 @@ class LightHazard {
 
   get reach() { return this.len * this.fade; }
 
-  contains(x, y) {
-    if (!this.dangerous || this.fade < 0.4) return false;
+  /** Is this point lit? `lethalOnly` keeps the old "does it burn" meaning. */
+  contains(x, y, level, lethalOnly) {
+    if (lethalOnly !== false && !this.dangerous) return false;
+    if (this.fade < 0.4) return false;
     const dx = x - this.x, dy = y - this.y;
     const d = Math.hypot(dx, dy);
     if (d > this.reach || d < this.nearSafe) return false;
-    if (Math.abs(angDiff(Math.atan2(dy, dx), this.dir)) > this.half) return false;
+    const a = Math.atan2(dy, dx);
+    if (Math.abs(angDiff(a, this.dir)) > this.half) return false;
     // beyond a wall the light only survives inside the doorway shaft
     if (this.shaft && y < this.shaft.wallY0 && (x < this.shaft.gx0 || x > this.shaft.gx1)) return false;
+    // walls cast real shadows for lights that ask for it
+    if (this.occluded && level && sightLimit(level, this.x, this.y, a, this.reach) < d - 1) return false;
     return true;
   }
+}
+
+/** The wall-aware outline of a light cone, shared by the drawing and the clip. */
+function conePoints(level, z, n) {
+  const pts = [];
+  const R = z.reach;
+  const a0 = z.dir - z.half, span = z.half * 2;
+  for (let i = 0; i <= n; i++) {
+    const a = a0 + span * (i / n);
+    const t = (z.occluded && level) ? Math.min(R, sightLimit(level, z.x, z.y, a, R)) : R;
+    pts.push([z.x + Math.cos(a) * t, z.y + Math.sin(a) * t]);
+  }
+  return pts;
 }
 
 /** Shared behaviour for everything the ghost can slip inside. */
@@ -545,6 +577,36 @@ class FloorLamp extends Possessable {
     return true;
   }
   update(dt) { this.sway = Math.max(0, this.sway - dt * 1.8); }
+}
+
+/**
+ * A lamp whose beam the player aims. Possess it, then drag (or press A/D) to
+ * sweep the light between two clamped angles — no spinning, no extra buttons.
+ */
+class RotatingLamp extends Possessable {
+  constructor(x, y, light, minDir, maxDir) {
+    super({ x, y, r: 28, name: 'aimlamp' });
+    this.light = light;
+    this.min = Math.min(minDir, maxDir);
+    this.max = Math.max(minDir, maxDir);
+    this.dir = clamp(light.dir, this.min, this.max);
+    this.light.dir = this.dir;
+    this.rotatable = true;
+    this.spin = 0;
+  }
+  actionLabel() { return null; }              // the big button stays RELEASE
+  update(dt, input) {
+    const want = (this.possessed && input) ? clamp(input.x, -1, 1) * 1.6 : 0;
+    this.spin = lerp(this.spin, want, smooth(dt, this.possessed ? 0.02 : 0.0005));
+    if (Math.abs(this.spin) > 0.002) {
+      const before = this.dir;
+      this.dir = clamp(this.dir + this.spin * dt, this.min, this.max);
+      if (this.dir === before) this.spin *= 0.4;   // soft stop at the limits
+      this.light.dir = this.dir;
+    }
+  }
+  /** 0..1 across the allowed sweep — used by the little dial indicator. */
+  get t() { return (this.dir - this.min) / Math.max(0.001, this.max - this.min); }
 }
 
 /** Fan: flavour object, shows that possessables can behave differently. */
@@ -637,8 +699,12 @@ class PressurePlate {
     this.ring = 0;
   }
   update(dt, level) {
-    const car = level.car;
-    const on = dist(car.x, car.y, this.x, this.y) < this.r - 6;
+    // anything heavy enough counts: the toy car, a pushed box, ... never the ghost
+    const heavies = level.heavy || (level.car ? [level.car] : []);
+    let on = false;
+    for (const o of heavies) {
+      if (dist(o.x, o.y, this.x, this.y) < this.r - 6) { on = true; break; }
+    }
     if (on !== this.pressed) {
       this.pressed = on;
       this.pulse = 1;
@@ -787,6 +853,96 @@ class HideSpot extends Possessable {
 }
 
 /**
+ * A hiding place the ghost can also steer. Heavier and slower than the ghost,
+ * collides with everything, and counts as weight on a pressure plate.
+ */
+class PushBox extends HideSpot {
+  constructor(x, y, kind) {
+    super(x, y, kind || 'box', 'cardboard box');
+    this.r = 20;
+    this.movable = true;
+    this.vx = 0; this.vy = 0;
+    this.scuff = 0;
+  }
+  update(dt, input, level) {
+    super.update(dt);                                   // wobble + peeking face
+    const speed = 96;                                   // clearly slower than the ghost
+    if (this.possessed && input && level) {
+      const k = smooth(dt, input.mag > 0.05 ? 0.03 : 0.002);
+      this.vx = lerp(this.vx, input.x * speed, k);
+      this.vy = lerp(this.vy, input.y * speed, k);
+    } else {
+      this.vx = lerp(this.vx, 0, smooth(dt, 0.0004));   // no sliding once released
+      this.vy = lerp(this.vy, 0, smooth(dt, 0.0004));
+    }
+    const sp = Math.hypot(this.vx, this.vy);
+    if (sp > 1 && level) {
+      this.x += this.vx * dt;
+      this.y += this.vy * dt;
+      if (Collide.resolve(this, level)) { this.vx *= 0.3; this.vy *= 0.3; }
+      this.scuff += sp * dt;
+      if (this.scuff > 26) {                            // little dust puffs while sliding
+        this.scuff = 0;
+        Particles.spawn({
+          x: this.x + rand(-14, 14), y: this.y + 16,
+          vx: rand(-14, 14), vy: rand(-14, 4),
+          life: rand(0.3, 0.6), size: rand(2, 4.5),
+          color: 'rgba(190,170,150,0.5)', glow: false, drag: 0.9
+        });
+      }
+    }
+  }
+}
+
+/** A little barrier that a pressure plate opens, once and for good. */
+class Gate {
+  constructor(x, y, w, h) {
+    this.x = x; this.y = y; this.w = w; this.h = h;
+    this.isOpen = false;
+    this.disabled = false;      // read by Collide.resolve and sightLimit
+    this.open = 0;              // animation 0..1
+  }
+  setOpen() {
+    if (this.isOpen) return;
+    this.isOpen = true;
+    this.disabled = true;
+    SFX.unlock();
+    const cx = this.x + this.w / 2, cy = this.y + this.h / 2;
+    Particles.burst(cx, cy, 26, { colors: ['#9dffc8', '#d9ffe9', '#fff2c8'], spdMax: 170 });
+    Particles.spawn({ x: cx, y: cy, vx: 0, vy: 0, life: 0.7, size: 20, color: '#9dffc8', shape: 'ring' });
+  }
+  update(dt) { this.open = lerp(this.open, this.isOpen ? 1 : 0, smooth(dt, 0.004)); }
+}
+
+/** A key lying on the floor. Walk into it to pick it up. */
+class KeyPickup {
+  constructor(x, y) {
+    this.x = x; this.y = y;
+    this.r = 16;
+    this.taken = false;
+    this.pop = 0;
+  }
+  tryTake(g) {
+    if (this.taken) return false;
+    if (dist(g.x, g.y, this.x, this.y) > this.r + g.r + 6) return false;
+    this.taken = true;
+    this.pop = 1;
+    SFX.key();
+    Particles.burst(this.x, this.y, 26, { colors: ['#ffe6a0', '#fff6d8', '#ffd166'], spdMax: 180 });
+    Particles.spawn({ x: this.x, y: this.y, vx: 0, vy: 0, life: 0.7, size: 16, color: '#ffe6a0', shape: 'ring' });
+    for (let i = 0; i < 8; i++) {
+      Particles.spawn({
+        x: this.x + rand(-14, 14), y: this.y + rand(-14, 6),
+        vx: rand(-20, 20), vy: rand(-90, -40),
+        life: rand(0.5, 1), size: rand(2.5, 5), color: '#ffeebb', shape: 'star', spin: rand(-6, 6)
+      });
+    }
+    return true;
+  }
+  update(dt) { this.pop = Math.max(0, this.pop - dt * 2); }
+}
+
+/**
  * A housemate. Walks a fixed polyline back and forth, pausing (and turning
  * around) at each end, and sees in a cone that real walls cut off.
  * Patrol + vision + detection only — nothing else, by design.
@@ -797,10 +953,12 @@ class Human {
       path: [{ x: 0, y: 0 }, { x: 0, y: 0 }],
       speed: 78,            // px per second — strollingly slow
       pause: 1.2,           // seconds spent at each end of the route
-      range: 190,           // how far they can see
+      range: 190,           // how far they can see into a lit area
+      darkRange: 0,         // ...and into darkness (0 = same as range)
       half: 0.46,           // half the cone angle, radians
       name: 'human'
     }, o);
+    if (!this.darkRange) this.darkRange = this.range;
     this.x = this.path[0].x;
     this.y = this.path[0].y;
     this.target = 1;
@@ -809,7 +967,15 @@ class Human {
     this.angle = Math.atan2(this.path[1].y - this.y, this.path[1].x - this.x);
     this.bob = 0;
     this.alert = 0;
+    this.curious = 0;       // "huh, that lamp just went out"
+    this.lookX = 0; this.lookY = 0;
     this.t = rand(0, 10);
+  }
+
+  /** Glance at something for a moment, then carry on. Not an investigation. */
+  startle(x, y) {
+    this.curious = 1.1;
+    this.lookX = x; this.lookY = y;
   }
 
   faceTowards(ax, ay, dt, rate) {
@@ -821,9 +987,18 @@ class Human {
     this.t += dt;
     const n = this.path[this.target];
 
+    if (this.curious > 0) {                      // stop and look at whatever changed
+      this.curious -= dt;
+      this.faceTowards(this.lookX, this.lookY, dt, 3.4);
+      return;
+    }
     if (this.paused > 0) {                       // pause, then turn around
       this.paused -= dt;
-      this.faceTowards(n.x, n.y, dt, 3.0);
+      // a waypoint may name a spot to stare at while standing there
+      const node = this.path[this.pauseNode];
+      const f = node && node.face;
+      if (f) this.faceTowards(f[0], f[1], dt, 3.0);
+      else this.faceTowards(n.x, n.y, dt, 3.0);
       return;
     }
 
@@ -834,7 +1009,11 @@ class Human {
       if (next >= this.path.length || next < 0) {  // an end of the route
         this.step *= -1;
         next = this.target + this.step;
+        this.pauseNode = this.target;
         this.paused = this.pause;
+      } else if (n.pause) {                        // a waypoint that asks for a stop
+        this.pauseNode = this.target;
+        this.paused = n.pause;
       }
       this.target = next;
       return;
@@ -850,11 +1029,14 @@ class Human {
   sees(x, y, level) {
     const dx = x - this.x, dy = y - this.y;
     const d = Math.hypot(dx, dy);
-    if (d > this.range) return false;
+    // in the dark they have to be much closer before they notice anything
+    const range = (this.darkRange < this.range && level.brightAt && !level.brightAt(x, y))
+      ? this.darkRange : this.range;
+    if (d > range) return false;
     if (d < 14) return true;
     const a = Math.atan2(dy, dx);
     if (Math.abs(angDiff(a, this.angle)) > this.half) return false;
-    return sightLimit(level, this.x, this.y, a, this.range) >= d - 1;
+    return sightLimit(level, this.x, this.y, a, range) >= d - 1;
   }
 }
 
@@ -1140,6 +1322,235 @@ function buildLevel3() {
   return L;
 }
 
+/* -----------------------------------------------------------------------------
+   LEVEL 4 — "The Locked Door": stealth plus a multi-step puzzle.
+   Three rooms. The exit is visible from the start but locked; the key sits in a
+   walled alcove whose gate only opens while something heavy holds the floor
+   button down. The only heavy thing is a cardboard box the ghost can possess
+   and push. A wire on the floor spells out button → gate.
+   ----------------------------------------------------------------------------- */
+
+const L4 = {
+  wallA:  { y0: 230, y1: 258, gx0: 300, gx1: 430 },  // exit room, doorway centre-right
+  wallB:  { y0: 640, y1: 668, endX: 360 },           // start room, doorway on the right
+  alcove: { x: 150, y: 258, w: 28, h: 142 },         // post that walls the key in
+  gate:   { x: 24,  y: 400, w: 126, h: 28 }          // ...and the gate underneath it
+};
+
+function buildLevel4() {
+  const L = {};
+  const A = L4.wallA, B = L4.wallB;
+
+  L.gate = new Gate(L4.gate.x, L4.gate.y, L4.gate.w, L4.gate.h);
+  const post = { x: L4.alcove.x, y: L4.alcove.y, w: L4.alcove.w, h: L4.alcove.h };
+  L.walls = [post];                                   // drawn as an upright wall block
+
+  L.rects = [
+    { x: -60, y: 0, w: 84, h: H },                                  // left wall
+    { x: ROOM.x1, y: 0, w: 84, h: H },                              // right wall
+    { x: 0, y: ROOM.y1, w: W, h: 84 },                              // bottom wall
+    { x: -60, y: -60, w: 60 + DOOR.x0, h: 84 },                     // top wall, left of door
+    { x: DOOR.x1, y: -60, w: W - DOOR.x1 + 60, h: 84 },             // top wall, right of door
+    { x: DOOR.x0, y: -90, w: DOOR.x1 - DOOR.x0, h: 96 },            // the door itself
+    { x: -60, y: A.y0, w: 60 + A.gx0, h: A.y1 - A.y0 },             // wall A, left of the doorway
+    { x: A.gx1, y: A.y0, w: W - A.gx1 + 60, h: A.y1 - A.y0 },       // wall A, right of it
+    post,                                                            // alcove post
+    L.gate,                                                          // the gate (stops colliding when open)
+    { x: -60, y: B.y0, w: 60 + B.endX, h: B.y1 - B.y0 },            // wall B
+
+    // ---- furniture ----
+    { x: 330, y: 60,  w: 152, h: 160, kind: 'bed' },        // exit room
+    { x: 60,  y: 120, w: 96,  h: 60,  kind: 'table' },
+    { x: 430, y: 260, w: 84,  h: 96,  kind: 'dresser' },    // middle room
+    { x: 60,  y: 560, w: 52,  h: 52,  kind: 'nightstand' },
+    { x: 60,  y: 780, w: 150, h: 88,  kind: 'sofa' },       // start room
+    { x: 250, y: 740, w: 96,  h: 58,  kind: 'table' },
+    { x: 200, y: 888, w: 130, h: 40,  kind: 'tv' }
+  ];
+
+  L.circles = [
+    { x: 486, y: 880, r: 22, kind: 'plant', seed: 10 },
+    { x: 60,  y: 700, r: 20, kind: 'plant', seed: 11 },
+    { x: 250, y: 290, r: 20, kind: 'plant', seed: 12 },
+    { x: 486, y: 150, r: 15, kind: 'nightlamp' },
+    // static hiding places are solid props
+    { x: 420, y: 730, r: 17, kind: 'hidebase' },
+    { x: 330, y: 560, r: 17, kind: 'hidebase' },
+    { x: 353, y: 363, r: 17, kind: 'hidebase' }
+  ];
+
+  L.nightLight = new LightHazard({
+    x: 486, y: 150, dir: -Math.PI / 2, half: 0.62, len: 130,
+    on: true, dangerous: false, nearSafe: 0
+  });
+  L.doorLight = new LightHazard({
+    x: (DOOR.x0 + DOOR.x1) / 2, y: 44, dir: Math.PI / 2, half: 0.62, len: 150,
+    on: false, dangerous: false, nearSafe: 0                       // lights up once unlocked
+  });
+  L.lights = [L.nightLight, L.doorLight];
+
+  // ---- three places to hide, plus the box that also moves ----
+  L.box = new PushBox(472, 566);
+  L.possessables = [
+    new HideSpot(420, 730, 'pot',   'flower pot'),      // start room, by the doorway
+    new HideSpot(330, 560, 'teddy', 'teddy bear'),      // middle room, by the box
+    new HideSpot(353, 363, 'basket', 'laundry basket'), // middle room, near the exit doorway
+    L.box
+  ];
+  L.movables = [L.box];       // dynamic colliders
+  L.heavy    = [L.box];       // what the floor button accepts
+
+  // ---- the puzzle chain: button → gate → key → door ----
+  L.plate = new PressurePlate(430, 414);
+  L.key   = new KeyPickup(86, 330);
+  L.wire  = [[430, 414], [430, 462], [87, 462], [87, 414]];   // drawn on the floor
+
+  L.door = new ExitDoor();    // starts locked; only the key opens it
+  L.needsKey = true;
+
+  L.humans = [new Human({
+    path: [
+      { x: 120, y: 590 },   // A — bottom-left, pause
+      { x: 440, y: 600 },   // B — across to the box corner
+      { x: 440, y: 470 },   // C — up the right side, past the button
+      { x: 200, y: 470 },   // D — back across the middle, past the gate
+      { x: 360, y: 300 }    // E — up to the exit doorway, pause, turn back
+    ],
+    speed: 96, pause: 1.2, range: 190, half: 0.46
+  })];
+
+  L.rug = { x: 250, y: 840, rx: 130, ry: 60 };
+  L.decor = [
+    { x: 192, y: 846, r: 14, kind: 'cushion', hue: '#5b6bb8' },
+    { x: 300, y: 862, r: 12, kind: 'cushion', hue: '#7a5b9e' },
+    { x: 288, y: 754, r: 11, kind: 'books' },
+    { x: 86,  y: 148, r: 10, kind: 'mug' }
+  ];
+
+  L.dividers = [
+    { y0: A.y0, y1: A.y1, segs: [[ROOM.x0, A.gx0], [A.gx1, ROOM.x1]],
+      jambs: [{ x: A.gx0, side: -1 }, { x: A.gx1, side: 1 }] },
+    { y0: B.y0, y1: B.y1, segs: [[ROOM.x0, B.endX]], jambs: [{ x: B.endX, side: -1 }] }
+  ];
+
+  finishLevel(L);
+  return L;
+}
+
+/* -----------------------------------------------------------------------------
+   LEVEL 5 — "Light & Shadow": the player rearranges the lighting itself.
+   Lit floor is dangerous at a distance (the housemate sees 200px into it) while
+   darkness hides you until they are almost on top of you (72px). Two lamps are
+   controllable: a standing lamp that switches off, and a table lamp whose beam
+   you aim between the two routes past the final wall.
+   ----------------------------------------------------------------------------- */
+
+const L5 = {
+  wallA: { y0: 560, y1: 588, endX: 300 },                 // doorway on the right
+  wallB: { y0: 300, y1: 328, gx0: 200, gx1: 330 }         // doorway in the middle
+};
+
+function buildLevel5() {
+  const L = {};
+  const A = L5.wallA, B = L5.wallB;
+
+  L.rects = [
+    { x: -60, y: 0, w: 84, h: H },                                  // left wall
+    { x: ROOM.x1, y: 0, w: 84, h: H },                              // right wall
+    { x: 0, y: ROOM.y1, w: W, h: 84 },                              // bottom wall
+    { x: -60, y: -60, w: 60 + DOOR.x0, h: 84 },                     // top wall, left of door
+    { x: DOOR.x1, y: -60, w: W - DOOR.x1 + 60, h: 84 },             // top wall, right of door
+    { x: DOOR.x0, y: -90, w: DOOR.x1 - DOOR.x0, h: 96 },            // the door itself
+    { x: -60, y: A.y0, w: 60 + A.endX, h: A.y1 - A.y0 },            // wall A
+    { x: -60, y: B.y0, w: 60 + B.gx0, h: B.y1 - B.y0 },             // wall B, left part
+    { x: B.gx1, y: B.y0, w: W - B.gx1 + 60, h: B.y1 - B.y0 },       // wall B, right part
+
+    // ---- furniture ----
+    { x: 50,  y: 672, w: 140, h: 80,  kind: 'sofa' },       // start room
+    { x: 200, y: 800, w: 96,  h: 56,  kind: 'table' },
+    { x: 330, y: 880, w: 130, h: 40,  kind: 'tv' },
+    { x: 40,  y: 440, w: 84,  h: 96,  kind: 'dresser' },    // middle corridor
+    // the bed splits the last room into a left and a right way round; light
+    // still sweeps over it, so the lamp decides which way is safe
+    { x: 190, y: 92,  w: 160, h: 148, kind: 'bed' },
+    { x: 60,  y: 44,  w: 56,  h: 56,  kind: 'nightstand' }  // exit strip
+  ];
+
+  L.circles = [
+    { x: 486, y: 852, r: 22, kind: 'plant', seed: 13 },
+    { x: 60,  y: 380, r: 20, kind: 'plant', seed: 14 },
+    { x: 486, y: 58,  r: 20, kind: 'plant', seed: 15 },
+    { x: 410, y: 648, r: 16, kind: 'lampbase' },            // the standing lamp
+    { x: 265, y: 262, r: 15, kind: 'aimlampbase' },         // the table lamp
+    { x: 140, y: 820, r: 17, kind: 'hidebase' },
+    { x: 330, y: 690, r: 17, kind: 'hidebase' },
+    { x: 360, y: 510, r: 17, kind: 'hidebase' },
+    { x: 150, y: 360, r: 17, kind: 'hidebase' }
+  ];
+
+  // ---- lamp 1: lights the only doorway out of the start room ----
+  L.lamp1Light = new LightHazard({
+    x: 410, y: 648, dir: -Math.PI / 2, half: 1.0, len: 280,
+    on: true, dangerous: false, bright: true, occluded: true, nearSafe: 24
+  });
+  // ---- lamp 2: aimable, covers both ways past the island wall ----
+  L.lamp2Light = new LightHazard({
+    x: 265, y: 262, dir: -0.75, half: 0.55, len: 320,
+    on: true, dangerous: false, bright: true, occluded: true, nearSafe: 22
+  });
+  L.doorLight = new LightHazard({
+    x: (DOOR.x0 + DOOR.x1) / 2, y: 44, dir: Math.PI / 2, half: 0.62, len: 120,
+    on: true, dangerous: false, nearSafe: 0
+  });
+  L.lights = [L.lamp1Light, L.lamp2Light, L.doorLight];
+
+  L.lamp = new FloorLamp(410, 648, L.lamp1Light);                       // on/off
+  L.aimLamp = new RotatingLamp(265, 262, L.lamp2Light, -2.50, -0.64);   // aimable
+
+  L.possessables = [
+    new HideSpot(140, 820, 'teddy',  'teddy bear'),     // dark start corner
+    new HideSpot(330, 690, 'pot',    'flower pot'),     // beside lamp 1
+    new HideSpot(360, 510, 'basket', 'laundry basket'), // just past the doorway
+    new HideSpot(150, 360, 'box',    'cardboard box'),  // before the middle doorway
+    L.lamp,
+    L.aimLamp
+  ];
+
+  L.door = new ExitDoor();
+  L.door.locked = false;
+  L.door.open = 1;
+
+  L.humans = [new Human({
+    path: [
+      // A — stands at the top of the doorway staring down it into the start room
+      { x: 455, y: 505, face: [430, 700] },
+      { x: 250, y: 420 },                              // B — across the corridor
+      // C — stops below the bed and looks up the left-hand way
+      { x: 230, y: 286, pause: 1.8, face: [100, 90] },
+      // D — and at the far end, up the right-hand way
+      { x: 430, y: 286, face: [470, 90] }
+    ],
+    speed: 100, pause: 2.2, range: 260, darkRange: 60, half: 0.46
+  })];
+
+  L.rug = { x: 240, y: 850, rx: 130, ry: 58 };
+  L.decor = [
+    { x: 186, y: 866, r: 14, kind: 'cushion', hue: '#5b6bb8' },
+    { x: 296, y: 852, r: 12, kind: 'cushion', hue: '#7a5b9e' },
+    { x: 236, y: 802, r: 11, kind: 'books' },
+    { x: 86,  y: 72,  r: 10, kind: 'mug' }
+  ];
+
+  L.dividers = [
+    { y0: A.y0, y1: A.y1, segs: [[ROOM.x0, A.endX]], jambs: [{ x: A.endX, side: -1 }] },
+    { y0: B.y0, y1: B.y1, segs: [[ROOM.x0, B.gx0], [B.gx1, ROOM.x1]],
+      jambs: [{ x: B.gx0, side: -1 }, { x: B.gx1, side: 1 }] }
+  ];
+
+  finishLevel(L);
+  return L;
+}
+
 /** Shared tail end of every build: defaults, sight blockers, helpers. */
 function finishLevel(L) {
   L.lights = L.lights || [];
@@ -1152,9 +1563,17 @@ function finishLevel(L) {
   // only real walls stop a look — furniture would just make the cone noisy
   L.sight = L.rects.filter(r => !r.kind);
 
-  L.lightAt = function (x, y) {
-    for (const l of this.lights) if (l.contains(x, y)) return true;
+  L.lightAt = function (x, y) {                 // light that burns the ghost
+    for (const l of this.lights) if (l.contains(x, y, this)) return true;
     return false;
+  };
+  L.brightAt = function (x, y) {                // light that makes the ghost easy to see
+    for (const l of this.lights) if (l.bright && l.contains(x, y, this, false)) return true;
+    return false;
+  };
+  /** A lamp was switched: nearby housemates glance over at it. */
+  L.lampChanged = function (x, y) {
+    for (const h of this.humans) if (dist(h.x, h.y, x, y) < 250) h.startle(x, y);
   };
   /** Is the ghost in somebody's view right now? */
   L.seenBy = function (x, y) {
@@ -1185,6 +1604,20 @@ const LEVELS = [
     winTitle: 'LEVEL 3 COMPLETE!',
     winText: 'Four hiding places, one perfectly timed escape.',
     startHint: 'Watch their route first, then hop from one hiding place to the next.'
+  },
+  {
+    name: 'Level 4', subtitle: 'The Locked Door', objective: 'Find the key',
+    spawn: { x: 250, y: 855 }, build: buildLevel4,
+    winTitle: 'LEVEL 4 COMPLETE!',
+    winText: 'Box pushed, gate opened, key stolen, door unlocked.',
+    startHint: 'The exit is locked. Something heavy could hold that floor button down...'
+  },
+  {
+    name: 'Level 5', subtitle: 'Light & Shadow', objective: 'Make your own darkness',
+    spawn: { x: 110, y: 870 }, build: buildLevel5,
+    winTitle: 'LEVEL 5 COMPLETE!',
+    winText: 'Lights out, shadows arranged, ghost gone.',
+    startHint: 'They see far in the light — but barely at all in the dark.'
   }
 ];
 
@@ -1243,10 +1676,10 @@ const Draw = {
   },
 
   /* ---------- lights ---------- */
-  cone(ctx, z, time) {
+  cone(ctx, z, time, level) {
     const R = z.reach;
     if (R < 10) return;
-    const warm = z.dangerous ? '255,206,120' : '255,236,190';
+    const warm = z.dangerous ? '255,206,120' : (z.bright ? '255,224,160' : '255,236,190');
     const pulse = z.flicker * (z.dangerous ? 1 + 0.05 * Math.sin(time * 2.3) : 1);
     const g = ctx.createRadialGradient(z.x, z.y, 6, z.x, z.y, R);
     g.addColorStop(0,    'rgba(' + warm + ',' + (0.62 * z.fade * pulse) + ')');
@@ -1258,9 +1691,16 @@ const Draw = {
     ctx.globalCompositeOperation = 'lighter';
     ctx.fillStyle = g;
     ctx.beginPath();
-    ctx.moveTo(z.x, z.y);
-    ctx.arc(z.x, z.y, R, z.dir - z.half, z.dir + z.half);
-    ctx.closePath();
+    if (z.occluded && level) {                   // walls carve real shadows out of it
+      const pts = conePoints(level, z, 26);
+      ctx.moveTo(z.x, z.y);
+      for (const p of pts) ctx.lineTo(p[0], p[1]);
+      ctx.closePath();
+    } else {
+      ctx.moveTo(z.x, z.y);
+      ctx.arc(z.x, z.y, R, z.dir - z.half, z.dir + z.half);
+      ctx.closePath();
+    }
     ctx.fill();
 
     // A readable danger boundary: the player must know exactly where it burns.
@@ -1322,15 +1762,31 @@ const Draw = {
         ctx.beginPath();
         ctx.rect(ROOM.x0, z.shaft.wallY1, ROOM.x1 - ROOM.x0, ROOM.y1 - z.shaft.wallY1);
         ctx.clip();
-        this.cone(ctx, z, time);
+        this.cone(ctx, z, time, level);
         ctx.restore();
         // ...and the shaft that escapes through the doorway
         this.shaftBeam(ctx, z, time);
       } else {
-        this.cone(ctx, z, time);
+        this.cone(ctx, z, time, level);
       }
     }
     ctx.restore();
+  },
+
+  /** Clip whatever comes next to the lit floor — used to split the vision cone. */
+  clipToBright(ctx, level) {
+    ctx.beginPath();
+    let any = false;
+    for (const z of level.lights) {
+      if (!z.bright || z.fade < 0.4 || z.reach < 10) continue;
+      const pts = conePoints(level, z, 20);
+      ctx.moveTo(z.x, z.y);
+      for (const p of pts) ctx.lineTo(p[0], p[1]);
+      ctx.closePath();
+      any = true;
+    }
+    if (!any) ctx.rect(0, 0, 0, 0);             // nothing lit: clip everything away
+    ctx.clip();
   },
 
   /* ---------- walls ---------- */
@@ -1602,6 +2058,69 @@ const Draw = {
     ctx.restore();
 
     if (lamp.glow > 0.02) this.possessAura(ctx, lamp.x, lamp.y - 50, 46, lamp.glow, time);
+  },
+
+  /** The aimable table lamp: a head that swings, plus a dial while you hold it. */
+  aimLamp(ctx, lamp, time) {
+    this.highlightRing(ctx, lamp, time);
+    softShadow(ctx, lamp.x, lamp.y + 6, 20, 9, 0.45);
+    const pop = 1 + lamp.pop * 0.12;
+    const on = lamp.light.fade;
+
+    // the sweep dial, only while the player is holding it
+    if (lamp.glow > 0.02) {
+      ctx.save();
+      ctx.globalAlpha = lamp.glow;
+      ctx.translate(lamp.x, lamp.y);
+      ctx.strokeStyle = 'rgba(150,215,255,0.35)';
+      ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(0, 0, 40, lamp.min, lamp.max); ctx.stroke();
+      ctx.strokeStyle = 'rgba(255,226,160,0.85)';
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.arc(0, 0, 40, lamp.dir - 0.06, lamp.dir + 0.06); ctx.stroke();
+      for (const a of [lamp.min, lamp.max]) {     // end stops
+        ctx.fillStyle = 'rgba(150,215,255,0.5)';
+        ctx.beginPath(); ctx.arc(Math.cos(a) * 40, Math.sin(a) * 40, 3.2, 0, TAU); ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    ctx.save();
+    ctx.translate(lamp.x, lamp.y);
+    ctx.scale(pop, pop);
+    ctx.fillStyle = '#3b4380';                                  // base
+    ctx.beginPath(); ctx.ellipse(0, 0, 17, 8, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = 'rgba(190,215,255,0.16)';
+    ctx.beginPath(); ctx.ellipse(0, -2, 17, 7, 0, 0, TAU); ctx.fill();
+    ctx.strokeStyle = '#5a639f'; ctx.lineWidth = 5; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(0, -2); ctx.lineTo(0, -24); ctx.stroke();
+
+    ctx.save();                                                 // the swinging head
+    ctx.translate(0, -26);
+    ctx.rotate(lamp.dir + Math.PI / 2);
+    const sg = ctx.createLinearGradient(0, -16, 0, 6);
+    sg.addColorStop(0, on > 0.5 ? '#ffe4a8' : '#5b6098');
+    sg.addColorStop(1, on > 0.5 ? '#ffb95e' : '#454a80');
+    ctx.fillStyle = sg;
+    ctx.beginPath();
+    ctx.moveTo(-11, 4); ctx.lineTo(11, 4); ctx.lineTo(17, -18); ctx.lineTo(-17, -18);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.18)'; ctx.lineWidth = 2; ctx.stroke();
+    if (on > 0.05) {
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      const g = ctx.createRadialGradient(0, -20, 2, 0, -20, 40);
+      g.addColorStop(0, 'rgba(255,231,170,' + (0.7 * on) + ')');
+      g.addColorStop(1, 'rgba(255,200,120,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(0, -20, 40, 0, TAU); ctx.fill();
+      ctx.restore();
+    }
+    ctx.restore();
+    ctx.restore();
+
+    if (lamp.glow > 0.02) this.possessAura(ctx, lamp.x, lamp.y - 20, 38, lamp.glow, time);
   },
 
   nightLamp(ctx, c, light, time) {
@@ -1974,44 +2493,212 @@ const Draw = {
     if (o.glow > 0.02) this.possessAura(ctx, o.x, o.y, 36, o.glow, time);
   },
 
+  /* ---------- walls, gates, wiring, keys ---------- */
+
+  /** An upright wall block, drawn in the same language as the divider bands. */
+  wallPost(ctx, r) {
+    softShadow(ctx, r.x + r.w / 2, r.y + r.h + 6, r.w / 2 + 8, 12, 0.45);
+    const g = ctx.createLinearGradient(0, r.y - 10, 0, r.y + r.h);
+    g.addColorStop(0, '#39417e');
+    g.addColorStop(1, '#1e2453');
+    ctx.fillStyle = g;
+    rr(ctx, r.x, r.y - 10, r.w, r.h + 10, 5); ctx.fill();
+    ctx.fillStyle = 'rgba(170,200,255,0.14)';
+    rr(ctx, r.x, r.y - 10, r.w, 4, 2); ctx.fill();
+  },
+
+  /** The floor wire that visibly links a button to whatever it opens. */
+  wire(ctx, pts, live, time) {
+    if (!pts || pts.length < 2) return;
+    ctx.save();
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.strokeStyle = 'rgba(120,150,220,0.22)';
+    ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.stroke();
+    if (live > 0.02) {                                  // energised: a travelling glow
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.strokeStyle = 'rgba(157,255,200,' + (0.55 * live) + ')';
+      ctx.lineWidth = 3;
+      ctx.setLineDash([14, 12]);
+      ctx.lineDashOffset = -time * 60;
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    ctx.restore();
+  },
+
+  gate(ctx, gt, time) {
+    const open = gt.open;
+    const cx = gt.x + gt.w / 2;
+    ctx.save();
+    ctx.globalAlpha = 1 - open * 0.85;
+    ctx.translate(0, open * (gt.h + 12));               // sinks into the floor
+    softShadow(ctx, cx, gt.y + gt.h + 4, gt.w / 2, 10, 0.4 * (1 - open));
+    const g = ctx.createLinearGradient(0, gt.y - 8, 0, gt.y + gt.h);
+    g.addColorStop(0, '#5b6bb0');
+    g.addColorStop(1, '#2c3468');
+    ctx.fillStyle = g;
+    rr(ctx, gt.x, gt.y - 8, gt.w, gt.h + 8, 5); ctx.fill();
+    ctx.fillStyle = 'rgba(20,26,60,0.55)';              // bars
+    const bars = 5;
+    for (let i = 0; i < bars; i++) {
+      const bx = gt.x + 8 + i * ((gt.w - 16) / (bars - 1)) - 2.5;
+      rr(ctx, bx, gt.y - 6, 5, gt.h + 4, 2.5); ctx.fill();
+    }
+    ctx.fillStyle = 'rgba(180,210,255,0.18)';
+    rr(ctx, gt.x, gt.y - 8, gt.w, 4, 2); ctx.fill();
+    ctx.restore();
+
+    if (open > 0.05 && open < 0.999) {                  // dust as it drops away
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = (1 - open) * 0.5;
+      ctx.fillStyle = '#9dffc8';
+      ctx.beginPath(); ctx.ellipse(cx, gt.y + gt.h / 2, gt.w / 2, 8, 0, 0, TAU); ctx.fill();
+      ctx.restore();
+    }
+  },
+
+  /** The little golden key: on the floor, or tucked behind the ghost. */
+  keyShape(ctx, x, y, s, glow, time) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(s, s);
+    if (glow) {
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      const g = ctx.createRadialGradient(0, 0, 2, 0, 0, 34);
+      g.addColorStop(0, 'rgba(255,224,150,' + (0.5 + 0.12 * Math.sin(time * 3)) + ')');
+      g.addColorStop(1, 'rgba(255,200,110,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(0, 0, 34, 0, TAU); ctx.fill();
+      ctx.restore();
+    }
+    ctx.rotate(-0.5);
+    const kg = ctx.createLinearGradient(-10, -10, 10, 10);
+    kg.addColorStop(0, '#ffe9a8'); kg.addColorStop(1, '#e0a93c');
+    ctx.strokeStyle = kg; ctx.fillStyle = kg;
+    ctx.lineWidth = 3.4; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.arc(-5, -5, 5.5, 0, TAU); ctx.stroke();       // bow
+    ctx.beginPath(); ctx.moveTo(-1.5, -1.5); ctx.lineTo(9, 9); ctx.stroke();  // shaft
+    ctx.beginPath(); ctx.moveTo(9, 9); ctx.lineTo(5.5, 12.5); ctx.stroke();   // teeth
+    ctx.beginPath(); ctx.moveTo(6, 6); ctx.lineTo(3, 9); ctx.stroke();
+    ctx.restore();
+  },
+
+  keyPickup(ctx, k, time) {
+    if (k.taken) return;
+    const bob = Math.sin(time * 2.2) * 4;
+    softShadow(ctx, k.x, k.y + 14, 14, 6, 0.4);
+    this.keyShape(ctx, k.x, k.y + bob, 1.25, true, time);
+    if (Math.random() < 0.04) {                         // occasional sparkle
+      Particles.spawn({
+        x: k.x + rand(-14, 14), y: k.y + rand(-12, 12),
+        vx: rand(-8, 8), vy: rand(-26, -8),
+        life: rand(0.4, 0.8), size: rand(1.6, 3), color: '#ffeebb', shape: 'star', spin: rand(-5, 5)
+      });
+    }
+  },
+
+  /** Key in hand: a small one drifting along behind the ghost. */
+  carriedKey(ctx, g, time) {
+    if (g.hidden) return;
+    const x = g.x - 22 + Math.sin(time * 2) * 3;
+    const y = g.y + 4 + Math.cos(time * 2.6) * 3;
+    this.keyShape(ctx, x, y, 0.7, true, time);
+  },
+
+  /** "It needs a key" — shown over the door when the ghost bumps into it. */
+  lockedHint(ctx, d, a, time) {
+    if (a <= 0.02) return;
+    const cx = (d.x0 + d.x1) / 2;
+    ctx.save();
+    ctx.globalAlpha = clamp(a, 0, 1);
+    ctx.translate(cx, 108 - a * 6);
+    ctx.fillStyle = 'rgba(10,14,36,0.82)';
+    ctx.beginPath(); ctx.ellipse(0, 0, 20, 18, 0, 0, TAU); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,214,150,0.45)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.ellipse(0, 0, 20, 18, 0, 0, TAU); ctx.stroke();
+    this.keyShape(ctx, 0, -1, 0.95, false, time);
+    ctx.restore();
+  },
+
   /* ---------- the housemate ---------- */
   visionCone(ctx, h, level, time) {
     const N = 28, R = h.range;
     const a0 = h.angle - h.half, span = h.half * 2;
-    const pts = [];
+    const reach = [];
     for (let i = 0; i <= N; i++) {
       const a = a0 + span * (i / N);
-      const t = Math.min(R, sightLimit(level, h.x, h.y, a, R));
-      pts.push([h.x + Math.cos(a) * t, h.y + Math.sin(a) * t]);
+      reach.push([a, Math.min(R, sightLimit(level, h.x, h.y, a, R))]);
     }
+    const poly = (cap) => {
+      ctx.beginPath();
+      ctx.moveTo(h.x, h.y);
+      for (const [a, t] of reach) {
+        const tt = cap ? Math.min(t, cap) : t;
+        ctx.lineTo(h.x + Math.cos(a) * tt, h.y + Math.sin(a) * tt);
+      }
+      ctx.closePath();
+    };
 
     const hot = h.alert;
     const col = hot > 0.05 ? '255,120,120' : '255,182,168';
     const pulse = 0.94 + 0.06 * Math.sin(time * 2.2);
-    const g = ctx.createRadialGradient(h.x, h.y, 6, h.x, h.y, R);
-    g.addColorStop(0,    'rgba(' + col + ',' + (0.42 + hot * 0.25) * pulse + ')');
-    g.addColorStop(0.5,  'rgba(' + col + ',' + (0.22 + hot * 0.2) * pulse + ')');
-    g.addColorStop(0.92, 'rgba(' + col + ',' + (0.10 + hot * 0.12) * pulse + ')');
-    g.addColorStop(1,    'rgba(' + col + ',0)');
+    const grad = rad => {
+      const g = ctx.createRadialGradient(h.x, h.y, 6, h.x, h.y, rad);
+      g.addColorStop(0,    'rgba(' + col + ',' + (0.42 + hot * 0.25) * pulse + ')');
+      g.addColorStop(0.5,  'rgba(' + col + ',' + (0.22 + hot * 0.2) * pulse + ')');
+      g.addColorStop(0.92, 'rgba(' + col + ',' + (0.10 + hot * 0.12) * pulse + ')');
+      g.addColorStop(1,    'rgba(' + col + ',0)');
+      return g;
+    };
 
     ctx.save();
     ctx.beginPath();
     ctx.rect(ROOM.x0, ROOM.y0, ROOM.x1 - ROOM.x0, ROOM.y1 - ROOM.y0);
     ctx.clip();
     ctx.globalCompositeOperation = 'lighter';
-    ctx.fillStyle = g;
-    ctx.beginPath();
-    ctx.moveTo(h.x, h.y);
-    for (const p of pts) ctx.lineTo(p[0], p[1]);
-    ctx.closePath();
-    ctx.fill();
 
-    ctx.strokeStyle = 'rgba(' + col + ',' + (0.3 + hot * 0.4) + ')';
-    ctx.lineWidth = 2;
-    ctx.setLineDash([9, 7]);
-    ctx.lineDashOffset = -time * 12;
-    ctx.stroke();
-    ctx.setLineDash([]);
+    const split = h.darkRange < h.range;
+    if (split) {
+      // the long reach only exists over lit floor...
+      ctx.save();
+      this.clipToBright(ctx, level);
+      ctx.fillStyle = grad(R);
+      poly(0);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(' + col + ',' + (0.26 + hot * 0.4) + ')';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([9, 7]);
+      ctx.lineDashOffset = -time * 12;
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+      // ...while this short core catches the ghost even in the dark
+      ctx.fillStyle = grad(h.darkRange);
+      poly(h.darkRange);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(' + col + ',' + (0.34 + hot * 0.4) + ')';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([5, 5]);
+      ctx.lineDashOffset = -time * 12;
+      ctx.stroke();
+      ctx.setLineDash([]);
+    } else {
+      ctx.fillStyle = grad(R);
+      poly(0);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(' + col + ',' + (0.3 + hot * 0.4) + ')';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([9, 7]);
+      ctx.lineDashOffset = -time * 12;
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
     ctx.restore();
   },
 
@@ -2061,17 +2748,27 @@ const Draw = {
     ctx.beginPath(); ctx.ellipse(8, -2, 2.6, 1.8, 0, 0, TAU); ctx.fill();
     ctx.restore();
 
-    // surprise bubble
-    if (hot > 0.03) {
+    // surprise bubble — "!" when spotted, "?" when a lamp clicks off nearby
+    const curious = clamp(h.curious, 0, 1);
+    if (hot > 0.03 || curious > 0.03) {
+      const q = hot <= 0.03;
       ctx.save();
-      ctx.globalAlpha = clamp(hot, 0, 1);
-      ctx.translate(0, -54 - hot * 5);
+      ctx.globalAlpha = q ? curious : clamp(hot, 0, 1);
+      ctx.translate(0, -54 - (q ? 2 : hot * 5));
       ctx.fillStyle = '#fff4f0';
       ctx.beginPath(); ctx.ellipse(0, 0, 11, 12, 0, 0, TAU); ctx.fill();
       ctx.beginPath(); ctx.moveTo(-4, 9); ctx.lineTo(4, 9); ctx.lineTo(0, 15); ctx.closePath(); ctx.fill();
-      ctx.fillStyle = '#e8576b';
-      rr(ctx, -2, -7, 4, 9, 2); ctx.fill();
-      ctx.beginPath(); ctx.arc(0, 5, 2.2, 0, TAU); ctx.fill();
+      if (q) {
+        ctx.strokeStyle = '#5b86c9'; ctx.lineWidth = 2.6; ctx.lineCap = 'round';
+        ctx.beginPath(); ctx.arc(0, -3.5, 3.4, Math.PI * 0.95, Math.PI * 0.25); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(1.6, 0.4); ctx.lineTo(0, 2.6); ctx.stroke();
+        ctx.fillStyle = '#5b86c9';
+        ctx.beginPath(); ctx.arc(0, 6, 1.9, 0, TAU); ctx.fill();
+      } else {
+        ctx.fillStyle = '#e8576b';
+        rr(ctx, -2, -7, 4, 9, 2); ctx.fill();
+        ctx.beginPath(); ctx.arc(0, 5, 2.2, 0, TAU); ctx.fill();
+      }
       ctx.restore();
     }
     ctx.restore();
@@ -2216,6 +2913,12 @@ const UI = {
   btnStart: document.getElementById('btn-start'),
   flash:    document.getElementById('flash'),
   levelTitle: document.querySelector('.level-title'),
+  levels:   document.getElementById('levels'),
+  levelGrid:document.getElementById('level-grid'),
+  btnLevels:document.getElementById('btn-levels'),
+  btnIntroLevels: document.getElementById('btn-intro-levels'),
+  btnOvLevels:    document.getElementById('btn-ov-levels'),
+  btnLevelsClose: document.getElementById('btn-levels-close'),
   banner:   document.getElementById('banner'),
   bannerTitle: document.getElementById('banner-title'),
   bannerSub:document.getElementById('banner-sub')
@@ -2291,6 +2994,20 @@ const Game = {
         this.toast('More levels coming soon! Here is this one again.', 3.2);
       }
     });
+    // ---- level picker ----
+    LEVELS.forEach((def, i) => {
+      const card = document.createElement('button');
+      card.className = 'level-card';
+      card.innerHTML = '<span class="n">' + (i + 1) + '</span><span class="sub"></span>';
+      card.querySelector('.sub').textContent = def.subtitle || def.objective || '';
+      tap(card, () => this.pickLevel(i));
+      UI.levelGrid.appendChild(card);
+    });
+    tap(UI.btnLevels,      () => this.openLevels());
+    tap(UI.btnIntroLevels, () => this.openLevels());
+    tap(UI.btnOvLevels,    () => this.openLevels());
+    tap(UI.btnLevelsClose, () => this.closeLevels());
+
     tap(UI.btnStart,   () => {
       UI.intro.classList.add('hidden');
       this.state = 'play';
@@ -2313,11 +3030,42 @@ const Game = {
     this.shake = 0;
     this.winT = 0;
     this.actionLock = 0;
+    this.lockedHintT = 0;
+    this.lockedNagT = 0;
     Particles.clear();
     UI.levelTitle.textContent = def.name;
     UI.objective.textContent = def.objective;
     UI.objective.classList.remove('done');
     if (this.state !== 'intro') this.state = 'play';
+  },
+
+  /* ---------------- level picker ---------------- */
+  openLevels() {
+    const cards = UI.levelGrid.children;
+    for (let i = 0; i < cards.length; i++) {
+      cards[i].classList.toggle('current', i === this.levelIndex);
+    }
+    // remember what to put back if they just browse and hit BACK
+    this.levelsFrom = this.state === 'intro' ? 'intro'
+      : (!UI.overlay.classList.contains('hidden') ? 'overlay' : 'play');
+    UI.intro.classList.add('hidden');
+    UI.overlay.classList.add('hidden');
+    UI.levels.classList.remove('hidden');
+  },
+  closeLevels() {
+    UI.levels.classList.add('hidden');
+    if (this.levelsFrom === 'intro') UI.intro.classList.remove('hidden');
+    else if (this.levelsFrom === 'overlay') UI.overlay.classList.remove('hidden');
+  },
+  /** Jump straight to a level from the picker (or a number key). */
+  pickLevel(i) {
+    if (i < 0 || i >= LEVELS.length) return;
+    UI.levels.classList.add('hidden');
+    UI.intro.classList.add('hidden');
+    this.hideOverlay();
+    UI.flash.classList.remove('on');
+    this.state = 'play';
+    this.goToLevel(i);
   },
 
   /** Load another level with a short title card. */
@@ -2380,6 +3128,7 @@ const Game = {
     if (p.name === 'lamp')      this.hint('h-lamp-in', 'Now press TURN OFF to kill the light');
     else if (p.name === 'car')  this.hint('h-car-in', 'Drive onto the glowing plate');
     else if (p.name === 'fan')  this.hint('h-fan-in', 'Spin it up! (not needed to escape)');
+    else if (p.rotatable)       this.hint('h-rotate', 'Drag left / right to aim the light', 3.2);
     else if (p.spot)            this.hint('h-hide-in', 'Nobody can see you in there. Wait, then RELEASE.', 3.2);
   },
 
@@ -2410,8 +3159,13 @@ const Game = {
     if (this.state !== 'play') return;
     const p = this.possessed;
     if (p) {
-      if (p.actionLabel()) p.activate();     // lamp / fan toggle
-      else this.doRelease();                 // car / hiding spot: the button is RELEASE
+      if (p.actionLabel()) {
+        p.activate();                        // lamp / fan toggle
+        // a lamp clicking off is the kind of thing a housemate notices
+        if (p.light && this.level.lampChanged) this.level.lampChanged(p.x, p.y);
+      } else {
+        this.doRelease();                    // car / hiding spot / aimed lamp
+      }
       return;
     }
     const t = this.findTarget();
@@ -2509,30 +3263,38 @@ const Game = {
     if (Input.takeRelease()) this.doRelease();
     const tapped = Input.takeTap();
     if (tapped) this.tapAt(tapped);
+    const lk = Input.takeLevelKey();               // 1..9 jumps straight to a level
+    if (lk) this.pickLevel(lk - 1);
 
     const input = (this.state === 'play') ? Input.vector() : { x: 0, y: 0, mag: 0 };
 
     if (this.state === 'play') {
-      // ghost or possessed object
+      // the drag/keys steer whatever the ghost is currently wearing
       if (L.car && this.possessed === L.car) {
         L.car.update(dt, input, L);
-        this.ghost.x = L.car.x; this.ghost.y = L.car.y;
+      } else if (this.possessed && this.possessed.movable) {
+        this.possessed.update(dt, input, L);            // a pushed box, etc.
       } else {
         this.ghost.update(dt, input, L);
-        if (L.car) L.car.update(dt, { x: 0, y: 0, mag: 0 }, L);
       }
-      if (this.possessed && this.possessed !== L.car) {
+      if (L.car && this.possessed !== L.car) L.car.update(dt, { x: 0, y: 0, mag: 0 }, L);
+      if (this.possessed) {
         this.ghost.x = this.possessed.x; this.ghost.y = this.possessed.y;
       }
     }
 
     if (L.lamp) L.lamp.update(dt);
     if (L.fan) L.fan.update(dt);
+    // aimable lamps: the drag steers the beam while the ghost is inside one
+    for (const p of L.possessables) {
+      if (p.rotatable) p.update(dt, p === this.possessed ? input : null);
+    }
     for (const l of L.lights) l.update(dt, this.time);
 
     this.target = this.findTarget();
     for (const p of L.possessables) p.tickCommon(dt, this.target === p);
-    for (const p of L.possessables) if (p.spot) p.update(dt);
+    // hiding places tick themselves; the one being steered was updated above
+    for (const p of L.possessables) if (p.spot && p !== this.possessed) p.update(dt, null, L);
 
     // ---- housemates: patrol, then look ----
     for (const h of L.humans) {
@@ -2545,8 +3307,15 @@ const Game = {
       }
     }
 
-    // pressure plate <-> door
-    if (L.plate && L.door) {
+    // ---- pressure plate: opens a gate here, or unlocks the door in level 1 ----
+    if (L.plate && L.gate) {
+      L.plate.update(dt, L);
+      if (L.plate.pressed && !L.gate.isOpen) {
+        L.gate.setOpen();
+        this.shake = 0.35;
+        this.hint('h-gate', 'Something opened over there!', 2.6);
+      }
+    } else if (L.plate && L.door) {
       L.plate.update(dt, L);
       if (L.plate.pressed === L.door.locked) {
         L.door.setLocked(!L.plate.pressed);
@@ -2563,6 +3332,40 @@ const Game = {
         }
       }
     }
+    if (L.gate) L.gate.update(dt);
+
+    // ---- key and locked door ----
+    if (L.key) {
+      L.key.update(dt);
+      if (this.state === 'play' && !this.possessed && !this.ghost.hidden && L.key.tryTake(this.ghost)) {
+        UI.objective.textContent = 'Unlock the exit';
+        this.toast('You found the key!', 2.4);
+        this.shake = 0.25;
+      }
+    }
+    if (L.needsKey && L.door) {
+      const g = this.ghost;
+      const atDoor = !this.possessed && g.y < 150 && g.x > L.door.x0 - 24 && g.x < L.door.x1 + 24;
+      if (atDoor && L.door.locked) {
+        if (L.key && L.key.taken) {                       // the key turns it on approach
+          L.door.setLocked(false);
+          L.doorLight.on = true;
+          UI.objective.textContent = 'Escape!';
+          UI.objective.classList.add('done');
+        } else {                                          // locked: shake, click, key icon
+          this.lockedHintT = Math.min(1, (this.lockedHintT || 0) + dt * 3);
+          this.lockedNagT = (this.lockedNagT || 0) - dt;
+          if (this.lockedNagT <= 0) {
+            this.lockedNagT = 1.3;
+            L.door.shake = 0.55;
+            SFX.locked();
+            this.hint('h-locked', 'Locked! A key must be somewhere in the house.', 3);
+          }
+        }
+      } else {
+        this.lockedHintT = Math.max(0, (this.lockedHintT || 0) - dt * 2.2);
+      }
+    }
     if (L.door) L.door.update(dt);
 
     Particles.update(dt);
@@ -2576,8 +3379,10 @@ const Game = {
       if (L.plate && dist(g.x, g.y, L.plate.x, L.plate.y) < L.plate.r)
         this.hint('h-plate', 'Too light! The plate needs something heavy');
       if (g.danger > 0.25) this.hint('h-burn', 'Get back in the shadows!', 2);
-      if (this.target && this.target.spot)
+      if (this.target && this.target.spot && !this.target.movable)
         this.hint('h-hide', 'Tap it (or press POSSESS) to hide inside', 3);
+      if (this.target && this.target.movable)
+        this.hint('h-push', 'Possess this one and you can push it around', 3.2);
     }
 
     // state transitions
@@ -2657,11 +3462,14 @@ const Game = {
 
     Draw.floor(ctx);
     if (L.rug) Draw.rug(ctx, L.rug);
+    if (L.wire) Draw.wire(ctx, L.wire, L.plate ? L.plate.press : 0, this.time);
     if (L.plate) Draw.plate(ctx, L.plate, this.time);
     Draw.lights(ctx, L, this.time);
     for (const h of L.humans) Draw.visionCone(ctx, h, L, this.time);
     Draw.walls(ctx);
     for (const d of L.dividers) Draw.divider(ctx, d);
+    if (L.gate) Draw.gate(ctx, L.gate, this.time);
+    for (const w of (L.walls || [])) Draw.wallPost(ctx, w);
 
     // furniture, back to front
     const furn = L.rects.filter(r => r.kind).sort((a, b) => (a.y + a.h) - (b.y + b.h));
@@ -2674,12 +3482,16 @@ const Game = {
 
     if (L.lamp) Draw.lamp(ctx, L.lamp, this.time);
     if (L.fan) Draw.fan(ctx, L.fan, this.time);
+    for (const p of L.possessables) if (p.rotatable) Draw.aimLamp(ctx, p, this.time);
     if (L.car) Draw.car(ctx, L.car, this.time);
+    if (L.key) Draw.keyPickup(ctx, L.key, this.time);
     for (const o of L.possessables) if (o.spot) Draw.hideSpot(ctx, o, this.time);
     for (const h of L.humans) Draw.human(ctx, h, this.time);
     if (L.door) Draw.door(ctx, L.door, this.time);
+    if (L.needsKey && L.door) Draw.lockedHint(ctx, L.door, this.lockedHintT || 0, this.time);
 
     Draw.ghost(ctx, this.ghost, this.time);
+    if (L.key && L.key.taken) Draw.carriedKey(ctx, this.ghost, this.time);
     Particles.draw(ctx);
     Draw.dangerMeter(ctx, this.ghost);
 
