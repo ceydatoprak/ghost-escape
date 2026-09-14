@@ -214,6 +214,38 @@ html,body{
   border:none;
 }
 
+/* ================= Level title card ================= */
+#banner{
+  position:absolute; inset:0;
+  display:flex; flex-direction:column;
+  align-items:center; justify-content:center;
+  gap:6px;
+  pointer-events:none;
+  opacity:0;
+  transition:opacity .45s ease;
+  z-index:6;
+  text-align:center;
+  background:radial-gradient(60% 30% at 50% 50%, rgba(10,16,42,.72), rgba(10,16,42,0) 70%);
+}
+#banner.show{ opacity:1; }
+#banner-title{
+  font-size:clamp(26px,9vw,44px);
+  font-weight:800; letter-spacing:.14em;
+  color:#eaf6ff;
+  text-shadow:0 0 26px rgba(120,200,255,.7), 0 4px 18px rgba(0,0,0,.6);
+  animation:bannerIn .5s cubic-bezier(.2,1.4,.4,1) both;
+}
+#banner-sub{
+  font-size:clamp(11px,3.4vw,15px);
+  letter-spacing:.24em; text-transform:uppercase;
+  color:#9fd4ff; opacity:.85;
+  animation:bannerIn .5s .08s cubic-bezier(.2,1.4,.4,1) both;
+}
+@keyframes bannerIn{
+  from{ transform:translateY(10px) scale(.94); opacity:0 }
+  to{ transform:none; opacity:1 }
+}
+
 /* Damage / transition flash */
 #flash{
   position:absolute; inset:0; pointer-events:none; z-index:8;

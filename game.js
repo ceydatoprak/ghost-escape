@@ -269,6 +269,8 @@ const Input = {
       this.drag.id = e.pointerId;
       this.drag.dx = this.drag.dy = 0;
       this.origin = { x: e.clientX, y: e.clientY };
+      this.downAt = performance.now();
+      this.moved = false;
       if (frame.setPointerCapture) { try { frame.setPointerCapture(e.pointerId); } catch (err) {} }
       this.ripple(e.clientX, e.clientY);
       e.preventDefault();
@@ -280,7 +282,14 @@ const Input = {
       e.preventDefault();
     }, { passive: false });
 
-    const up = e => { if (this.drag.active && e.pointerId === this.drag.id) this.endDrag(); };
+    // a touch that never really moved is a tap: used to possess/leave objects
+    const up = e => {
+      if (!this.drag.active || e.pointerId !== this.drag.id) return;
+      if (!this.moved && performance.now() - this.downAt < 380) {
+        this.tapPoint = this.toLogical(e.clientX, e.clientY);
+      }
+      this.endDrag();
+    };
     frame.addEventListener('pointerup', up);
     frame.addEventListener('pointercancel', up);
     addEventListener('pointerup', up);
@@ -311,9 +320,17 @@ const Input = {
     return !!(el && el.closest && el.closest('button, #overlay, #intro'));
   },
 
+  /** Screen pixels → the canvas' logical 540x960 space. */
+  toLogical(clientX, clientY) {
+    const r = this.frame.getBoundingClientRect();
+    if (!r.width || !r.height) return null;
+    return { x: ((clientX - r.left) / r.width) * W, y: ((clientY - r.top) / r.height) * H };
+  },
+
   move(e) {
     let dx = e.clientX - this.origin.x, dy = e.clientY - this.origin.y;
     const d = Math.hypot(dx, dy);
+    if (d > this.deadZone) this.moved = true;
     if (d <= this.deadZone) { this.drag.dx = this.drag.dy = 0; return; }
     // 0 at the dead zone edge, 1 once the drag passes fullDrag, clamped there
     const mag = clamp((d - this.deadZone) / (this.fullDrag - this.deadZone), 0, 1);
@@ -328,10 +345,9 @@ const Input = {
 
   /** A single soft ripple so the player knows the touch registered. */
   ripple(clientX, clientY) {
-    const r = this.frame.getBoundingClientRect();
-    if (!r.width || !r.height) return;
-    const x = ((clientX - r.left) / r.width) * W;
-    const y = ((clientY - r.top) / r.height) * H;
+    const p = this.toLogical(clientX, clientY);
+    if (!p) return;
+    const x = p.x, y = p.y;
     Particles.spawn({ x, y, vx: 0, vy: 0, life: 0.36, size: 9, color: 'rgba(150,215,255,0.85)', shape: 'ring' });
     Particles.spawn({ x, y, vx: 0, vy: 0, life: 0.22, size: 4, color: 'rgba(200,240,255,0.8)', shape: 'ring' });
   },
@@ -354,7 +370,8 @@ const Input = {
   },
 
   takeAction()  { const v = this.actionEdge;  this.actionEdge = false;  return v; },
-  takeRelease() { const v = this.releaseEdge; this.releaseEdge = false; return v; }
+  takeRelease() { const v = this.releaseEdge; this.releaseEdge = false; return v; },
+  takeTap()     { const v = this.tapPoint;    this.tapPoint = null;     return v; }
 };
 
 /* =============================================================================
@@ -409,6 +426,44 @@ const Collide = {
     return hit;
   }
 };
+
+/** Ray vs AABB (slab test). Returns the distance along the ray, or Infinity. */
+function rayRectT(ox, oy, dx, dy, r, maxT) {
+  let tmin = 0, tmax = maxT;
+  if (Math.abs(dx) < 1e-6) {
+    if (ox < r.x || ox > r.x + r.w) return Infinity;
+  } else {
+    let t1 = (r.x - ox) / dx, t2 = (r.x + r.w - ox) / dx;
+    if (t1 > t2) { const t = t1; t1 = t2; t2 = t; }
+    tmin = Math.max(tmin, t1); tmax = Math.min(tmax, t2);
+    if (tmin > tmax) return Infinity;
+  }
+  if (Math.abs(dy) < 1e-6) {
+    if (oy < r.y || oy > r.y + r.h) return Infinity;
+  } else {
+    let t1 = (r.y - oy) / dy, t2 = (r.y + r.h - oy) / dy;
+    if (t1 > t2) { const t = t1; t1 = t2; t2 = t; }
+    tmin = Math.max(tmin, t1); tmax = Math.min(tmax, t2);
+    if (tmin > tmax) return Infinity;
+  }
+  return tmin;
+}
+
+/**
+ * How far a sight line travels before a wall stops it. Only real walls block
+ * sight (level.sight), so vision cones stay clean and readable.
+ */
+function sightLimit(level, ox, oy, ang, maxLen) {
+  const blockers = level.sight;
+  if (!blockers || !blockers.length) return maxLen;
+  const dx = Math.cos(ang), dy = Math.sin(ang);
+  let best = maxLen;
+  for (const r of blockers) {
+    const t = rayRectT(ox, oy, dx, dy, r, maxLen);
+    if (t < best) best = t;
+  }
+  return best;
+}
 
 /* =============================================================================
    5. ENTITIES
@@ -709,11 +764,105 @@ class Ghost {
   }
 }
 
+/**
+ * A hiding place: the ghost slips inside and the house cannot see it.
+ * `kind` picks the drawing ('pot' | 'box' | 'teddy'); everything else is shared.
+ */
+class HideSpot extends Possessable {
+  constructor(x, y, kind, label) {
+    super({ x, y, r: 26, name: kind, kind, label: label || kind });
+    this.spot = true;
+    this.wobble = 0;
+    this.peek = 0;          // the little ghost face that fades in after hiding
+    this.seed = rand(0, 10);
+  }
+  actionLabel() { return null; }          // the big button just says RELEASE
+  onPossess() { this.pop = 1; this.wobble = 1; this.peek = 1.4; }
+  onRelease() { this.pop = 1; this.wobble = 1; }
+  update(dt) {
+    this.wobble = Math.max(0, this.wobble - dt * 1.5);
+    if (this.possessed) this.peek = Math.min(1.4, this.peek + dt * 0.6);
+    else this.peek = Math.max(0, this.peek - dt * 3);
+  }
+}
+
+/**
+ * A housemate. Walks a fixed polyline back and forth, pausing (and turning
+ * around) at each end, and sees in a cone that real walls cut off.
+ * Patrol + vision + detection only — nothing else, by design.
+ */
+class Human {
+  constructor(o) {
+    Object.assign(this, {
+      path: [{ x: 0, y: 0 }, { x: 0, y: 0 }],
+      speed: 78,            // px per second — strollingly slow
+      pause: 1.2,           // seconds spent at each end of the route
+      range: 190,           // how far they can see
+      half: 0.46,           // half the cone angle, radians
+      name: 'human'
+    }, o);
+    this.x = this.path[0].x;
+    this.y = this.path[0].y;
+    this.target = 1;
+    this.step = 1;          // +1 walking forward along the path, -1 coming back
+    this.paused = 0;
+    this.angle = Math.atan2(this.path[1].y - this.y, this.path[1].x - this.x);
+    this.bob = 0;
+    this.alert = 0;
+    this.t = rand(0, 10);
+  }
+
+  faceTowards(ax, ay, dt, rate) {
+    const want = Math.atan2(ay - this.y, ax - this.x);
+    this.angle += clamp(angDiff(want, this.angle), -rate * dt, rate * dt);
+  }
+
+  update(dt) {
+    this.t += dt;
+    const n = this.path[this.target];
+
+    if (this.paused > 0) {                       // pause, then turn around
+      this.paused -= dt;
+      this.faceTowards(n.x, n.y, dt, 3.0);
+      return;
+    }
+
+    const dx = n.x - this.x, dy = n.y - this.y;
+    const d = Math.hypot(dx, dy);
+    if (d < 2.5) {
+      let next = this.target + this.step;
+      if (next >= this.path.length || next < 0) {  // an end of the route
+        this.step *= -1;
+        next = this.target + this.step;
+        this.paused = this.pause;
+      }
+      this.target = next;
+      return;
+    }
+    const move = Math.min(this.speed * dt, d);
+    this.x += (dx / d) * move;
+    this.y += (dy / d) * move;
+    this.bob += move * 0.09;
+    this.faceTowards(n.x, n.y, dt, 4.5);
+  }
+
+  /** Can this human see the point? Cone + range + walls. */
+  sees(x, y, level) {
+    const dx = x - this.x, dy = y - this.y;
+    const d = Math.hypot(dx, dy);
+    if (d > this.range) return false;
+    if (d < 14) return true;
+    const a = Math.atan2(dy, dx);
+    if (Math.abs(angDiff(a, this.angle)) > this.half) return false;
+    return sightLimit(level, this.x, this.y, a, this.range) >= d - 1;
+  }
+}
+
 /* =============================================================================
-   6. LEVEL — the single cozy room
+   6. LEVELS — each build function returns one self-contained room
    ============================================================================= */
 
-function buildLevel() {
+function buildLevel1() {
   const L = {};
 
   // ---- static colliders (walls are thick and reach outside the frame) ----
@@ -784,13 +933,148 @@ function buildLevel() {
     { x: 238, y: 348, r: 10, kind: 'mug' }
   ];
 
+  L.dividers = [{
+    y0: DIV.y0, y1: DIV.y1,
+    segs: [[ROOM.x0, DIV.gx0], [DIV.gx1, ROOM.x1]],
+    jambs: [{ x: DIV.gx0, side: -1 }, { x: DIV.gx1, side: 1 }]
+  }];
+
+  finishLevel(L);
+  return L;
+}
+
+/* -----------------------------------------------------------------------------
+   LEVEL 2 — "First Human": patrol, vision cone, and three places to hide.
+   Three rooms stacked bottom → middle → top, linked by two offset doorways.
+   The housemate paces the middle room, sweeping both doorways in turn.
+   ----------------------------------------------------------------------------- */
+
+const L2 = {
+  wallA: { y0: 600, y1: 628, endX: 360 },   // lower wall, gap on the right
+  wallB: { y0: 300, y1: 328, startX: 200 }  // upper wall, gap on the left
+};
+
+function buildLevel2() {
+  const L = {};
+  const A = L2.wallA, B = L2.wallB;
+
+  L.rects = [
+    { x: -60, y: 0, w: 84, h: H },                                  // left wall
+    { x: ROOM.x1, y: 0, w: 84, h: H },                              // right wall
+    { x: 0, y: ROOM.y1, w: W, h: 84 },                              // bottom wall
+    { x: -60, y: -60, w: 60 + DOOR.x0, h: 84 },                     // top wall, left of door
+    { x: DOOR.x1, y: -60, w: W - DOOR.x1 + 60, h: 84 },             // top wall, right of door
+    { x: DOOR.x0, y: -90, w: DOOR.x1 - DOOR.x0, h: 96 },            // the door itself
+    { x: -60, y: A.y0, w: 60 + A.endX, h: A.y1 - A.y0 },            // lower divider
+    { x: B.startX, y: B.y0, w: W - B.startX + 60, h: B.y1 - B.y0 }, // upper divider
+
+    // ---- furniture ----
+    { x: 56,  y: 790, w: 150, h: 90,  kind: 'sofa' },       // bottom room
+    { x: 62,  y: 662, w: 104, h: 70,  kind: 'table' },
+    { x: 336, y: 878, w: 134, h: 44,  kind: 'tv' },
+    { x: 40,  y: 452, w: 84,  h: 96,  kind: 'dresser' },    // middle room
+    { x: 40,  y: 350, w: 56,  h: 56,  kind: 'nightstand' },
+    { x: 336, y: 60,  w: 152, h: 172, kind: 'bed' },        // top room
+    { x: 44,  y: 120, w: 100, h: 66,  kind: 'table' }
+  ];
+
+  L.circles = [
+    { x: 486, y: 872, r: 22, kind: 'plant', seed: 4 },
+    { x: 170, y: 560, r: 20, kind: 'plant', seed: 5 },
+    { x: 486, y: 252, r: 22, kind: 'plant', seed: 6 },
+    { x: 486, y: 786, r: 15, kind: 'nightlamp' },
+    // the hiding places are solid little props too
+    { x: 400, y: 686, r: 17, kind: 'hidebase' },
+    { x: 250, y: 430, r: 17, kind: 'hidebase' },
+    { x: 130, y: 242, r: 17, kind: 'hidebase' }
+  ];
+
+  // ---- lights: level 2 has no burning light at all, only cozy glow ----
+  L.nightLight = new LightHazard({
+    x: 486, y: 786, dir: -Math.PI / 2, half: 0.62, len: 150,
+    on: true, dangerous: false, nearSafe: 0
+  });
+  L.doorLight = new LightHazard({
+    x: (DOOR.x0 + DOOR.x1) / 2, y: 44, dir: Math.PI / 2, half: 0.62, len: 150,
+    on: true, dangerous: false, nearSafe: 0
+  });
+  L.lights = [L.nightLight, L.doorLight];
+
+  // ---- hiding places, in the order the player meets them ----
+  L.possessables = [
+    new HideSpot(400, 686, 'pot',   'flower pot'),
+    new HideSpot(250, 430, 'box',   'cardboard box'),
+    new HideSpot(130, 242, 'teddy', 'teddy bear')
+  ];
+
+  // ---- the housemate: up the right side, across the middle, peek through the door ----
+  L.humans = [new Human({
+    path: [{ x: 440, y: 500 }, { x: 440, y: 384 }, { x: 150, y: 384 }, { x: 150, y: 344 }],
+    speed: 78, pause: 1.2, range: 190, half: 0.46
+  })];
+
+  // ---- the way out is already open here; the human is the only obstacle ----
+  L.door = new ExitDoor();
+  L.door.locked = false;
+  L.door.open = 1;
+
+  L.rug = { x: 250, y: 800, rx: 140, ry: 88 };
+  L.decor = [
+    { x: 206, y: 758, r: 15, kind: 'cushion', hue: '#5b6bb8' },
+    { x: 168, y: 826, r: 13, kind: 'cushion', hue: '#7a5b9e' },
+    { x: 110, y: 686, r: 11, kind: 'books' },
+    { x: 94,  y: 140, r: 10, kind: 'mug' }
+  ];
+
+  L.dividers = [
+    { y0: A.y0, y1: A.y1, segs: [[ROOM.x0, A.endX]], jambs: [{ x: A.endX, side: -1 }] },
+    { y0: B.y0, y1: B.y1, segs: [[B.startX, ROOM.x1]], jambs: [{ x: B.startX, side: 1 }] }
+  ];
+
+  finishLevel(L);
+  return L;
+}
+
+/** Shared tail end of every build: defaults, sight blockers, helpers. */
+function finishLevel(L) {
+  L.lights = L.lights || [];
+  L.possessables = L.possessables || [];
+  L.humans = L.humans || [];
+  L.decor = L.decor || [];
+  L.circles = L.circles || [];
+  L.dividers = L.dividers || [];
+
+  // only real walls stop a look — furniture would just make the cone noisy
+  L.sight = L.rects.filter(r => !r.kind);
+
   L.lightAt = function (x, y) {
     for (const l of this.lights) if (l.contains(x, y)) return true;
     return false;
   };
-
+  /** Is the ghost in somebody's view right now? */
+  L.seenBy = function (x, y) {
+    for (const h of this.humans) if (h.sees(x, y, this)) return h;
+    return null;
+  };
   return L;
 }
+
+/* ---- the level list; add future levels here ---- */
+const LEVELS = [
+  {
+    name: 'Level 1', objective: 'Reach the exit',
+    spawn: { x: 262, y: 826 }, build: buildLevel1,
+    winTitle: 'LEVEL COMPLETE!',
+    winText: 'The little ghost slipped away into the night.'
+  },
+  {
+    name: 'Level 2', subtitle: 'First Human', objective: 'Do not be seen',
+    spawn: { x: 270, y: 872 }, build: buildLevel2,
+    winTitle: 'LEVEL 2 COMPLETE!',
+    winText: 'Not a single floorboard creaked.',
+    startHint: 'Someone is awake! Hide inside things to stay unseen.'
+  }
+];
 
 /* =============================================================================
    7. RENDER — everything is drawn procedurally onto the canvas
@@ -985,23 +1269,23 @@ const Draw = {
     }
   },
 
-  divider(ctx) {
-    const h = DIV.y1 - DIV.y0;
-    const seg = [[ROOM.x0, DIV.gx0], [DIV.gx1, ROOM.x1]];
-    for (const [a, b] of seg) {
-      softShadow(ctx, (a + b) / 2, DIV.y1 + 8, (b - a) / 2, 14, 0.45);
-      const g = ctx.createLinearGradient(0, DIV.y0 - 10, 0, DIV.y1);
+  divider(ctx, d) {
+    const h = d.y1 - d.y0;
+    for (const [a, b] of d.segs) {
+      softShadow(ctx, (a + b) / 2, d.y1 + 8, (b - a) / 2, 14, 0.45);
+      const g = ctx.createLinearGradient(0, d.y0 - 10, 0, d.y1);
       g.addColorStop(0, '#39417e');
       g.addColorStop(1, '#1e2453');
       ctx.fillStyle = g;
-      rr(ctx, a, DIV.y0 - 10, b - a, h + 10, 5); ctx.fill();
+      rr(ctx, a, d.y0 - 10, b - a, h + 10, 5); ctx.fill();
       ctx.fillStyle = 'rgba(170,200,255,0.14)';
-      rr(ctx, a, DIV.y0 - 10, b - a, 4, 2); ctx.fill();
+      rr(ctx, a, d.y0 - 10, b - a, 4, 2); ctx.fill();
     }
     // doorway jambs
     ctx.fillStyle = 'rgba(255,225,180,0.10)';
-    ctx.fillRect(DIV.gx0 - 3, DIV.y0 - 10, 3, h + 10);
-    ctx.fillRect(DIV.gx1, DIV.y0 - 10, 3, h + 10);
+    for (const j of d.jambs) {
+      ctx.fillRect(j.side < 0 ? j.x - 3 : j.x, d.y0 - 10, 3, h + 10);
+    }
   },
 
   /* ---------- generic 2.5D block ---------- */
@@ -1460,6 +1744,205 @@ const Draw = {
     ctx.restore();
   },
 
+  /* ---------- hiding places ---------- */
+  hideSpot(ctx, o, time) {
+    this.highlightRing(ctx, o, time);
+    const tilt = Math.sin(time * 9 + o.seed) * 0.10 * o.wobble
+               + (o.possessed ? Math.sin(time * 2.4 + o.seed) * 0.03 : 0);
+    const pop = 1 + o.pop * 0.14;
+    softShadow(ctx, o.x, o.y + 10, 24, 10, 0.45);
+
+    ctx.save();
+    ctx.translate(o.x, o.y + 8);
+    ctx.rotate(tilt);
+    ctx.scale(pop, pop);
+    ctx.translate(0, -8);
+
+    if (o.kind === 'pot') {
+      const sway = Math.sin(time * 1.4 + o.seed) * 0.10;
+      for (let i = 0; i < 5; i++) {                       // leaves
+        const a = -Math.PI / 2 + (i - 2) * 0.5 + sway;
+        const len = 30 + (i % 2) * 10;
+        ctx.save(); ctx.rotate(a);
+        const lg = ctx.createLinearGradient(0, 0, 0, -len);
+        lg.addColorStop(0, '#2f6b52'); lg.addColorStop(1, '#4fb489');
+        ctx.fillStyle = lg;
+        ctx.beginPath(); ctx.ellipse(0, -len * 0.55, 6, len * 0.55, 0, 0, TAU); ctx.fill();
+        ctx.restore();
+      }
+      const pg = ctx.createLinearGradient(0, -4, 0, 20);   // terracotta pot
+      pg.addColorStop(0, '#d98a63'); pg.addColorStop(1, '#a85f45');
+      ctx.fillStyle = pg;
+      ctx.beginPath();
+      ctx.moveTo(-17, -4); ctx.lineTo(17, -4); ctx.lineTo(12, 20); ctx.lineTo(-12, 20);
+      ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#e39a72';
+      rr(ctx, -19, -9, 38, 8, 3); ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.16)';
+      rr(ctx, -14, -2, 5, 18, 2.5); ctx.fill();
+
+    } else if (o.kind === 'box') {
+      ctx.fillStyle = '#8a6242';                          // open flaps
+      ctx.beginPath(); ctx.moveTo(-20, -8); ctx.lineTo(-4, -4); ctx.lineTo(-9, -17); ctx.closePath(); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(20, -8); ctx.lineTo(4, -4); ctx.lineTo(9, -17); ctx.closePath(); ctx.fill();
+      const bg = ctx.createLinearGradient(0, -8, 0, 22);   // cardboard body
+      bg.addColorStop(0, '#c99562'); bg.addColorStop(1, '#9a6b44');
+      ctx.fillStyle = bg;
+      rr(ctx, -21, -8, 42, 30, 4); ctx.fill();
+      ctx.fillStyle = 'rgba(60,36,20,0.35)';              // dark opening
+      rr(ctx, -15, -8, 30, 7, 3); ctx.fill();
+      ctx.strokeStyle = 'rgba(255,240,210,0.35)'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(0, -1); ctx.lineTo(0, 22); ctx.stroke();
+      ctx.fillStyle = 'rgba(255,255,255,0.10)';
+      rr(ctx, -18, -5, 6, 24, 3); ctx.fill();
+
+    } else {                                              // teddy bear
+      ctx.fillStyle = '#b07a52';
+      ctx.beginPath(); ctx.ellipse(-14, 6, 6, 6, 0, 0, TAU); ctx.fill();   // arms
+      ctx.beginPath(); ctx.ellipse(14, 6, 6, 6, 0, 0, TAU); ctx.fill();
+      const tg = ctx.createLinearGradient(0, -6, 0, 22);
+      tg.addColorStop(0, '#d0996b'); tg.addColorStop(1, '#a9754c');
+      ctx.fillStyle = tg;
+      ctx.beginPath(); ctx.ellipse(0, 8, 14, 13, 0, 0, TAU); ctx.fill();   // body
+      ctx.fillStyle = '#b07a52';
+      ctx.beginPath(); ctx.arc(-9, -16, 5.5, 0, TAU); ctx.fill();          // ears
+      ctx.beginPath(); ctx.arc(9, -16, 5.5, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#d0996b';
+      ctx.beginPath(); ctx.arc(0, -10, 12, 0, TAU); ctx.fill();            // head
+      ctx.fillStyle = '#efc79c';
+      ctx.beginPath(); ctx.ellipse(0, -6, 6.5, 5, 0, 0, TAU); ctx.fill();  // muzzle
+      if (!o.possessed) {
+        ctx.fillStyle = '#3a2a22';
+        ctx.beginPath(); ctx.arc(-4.5, -13, 1.8, 0, TAU); ctx.fill();
+        ctx.beginPath(); ctx.arc(4.5, -13, 1.8, 0, TAU); ctx.fill();
+        ctx.beginPath(); ctx.arc(0, -8, 2, 0, TAU); ctx.fill();
+      }
+    }
+
+    // the ghost peeking out of whatever it is wearing
+    if (o.peek > 0.02) {
+      const a = clamp(o.peek, 0, 1) * (0.55 + 0.25 * Math.sin(time * 2.6));
+      ctx.save();
+      ctx.globalAlpha = a;
+      ctx.fillStyle = '#22285a';
+      const ey = o.kind === 'teddy' ? -13 : 4;
+      ctx.beginPath(); ctx.ellipse(-4.5, ey, 2.1, 2.9, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(4.5, ey, 2.1, 2.9, 0, 0, TAU); ctx.fill();
+      ctx.strokeStyle = '#22285a'; ctx.lineWidth = 1.3; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.arc(0, ey + 4, 2.4, 0.2, Math.PI - 0.2); ctx.stroke();
+      ctx.fillStyle = 'rgba(255,150,170,0.4)';
+      ctx.beginPath(); ctx.ellipse(-9, ey + 3, 2.6, 1.8, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(9, ey + 3, 2.6, 1.8, 0, 0, TAU); ctx.fill();
+      ctx.restore();
+    }
+    ctx.restore();
+
+    if (o.glow > 0.02) this.possessAura(ctx, o.x, o.y, 36, o.glow, time);
+  },
+
+  /* ---------- the housemate ---------- */
+  visionCone(ctx, h, level, time) {
+    const N = 28, R = h.range;
+    const a0 = h.angle - h.half, span = h.half * 2;
+    const pts = [];
+    for (let i = 0; i <= N; i++) {
+      const a = a0 + span * (i / N);
+      const t = Math.min(R, sightLimit(level, h.x, h.y, a, R));
+      pts.push([h.x + Math.cos(a) * t, h.y + Math.sin(a) * t]);
+    }
+
+    const hot = h.alert;
+    const col = hot > 0.05 ? '255,120,120' : '255,182,168';
+    const pulse = 0.94 + 0.06 * Math.sin(time * 2.2);
+    const g = ctx.createRadialGradient(h.x, h.y, 6, h.x, h.y, R);
+    g.addColorStop(0,    'rgba(' + col + ',' + (0.42 + hot * 0.25) * pulse + ')');
+    g.addColorStop(0.5,  'rgba(' + col + ',' + (0.22 + hot * 0.2) * pulse + ')');
+    g.addColorStop(0.92, 'rgba(' + col + ',' + (0.10 + hot * 0.12) * pulse + ')');
+    g.addColorStop(1,    'rgba(' + col + ',0)');
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(ROOM.x0, ROOM.y0, ROOM.x1 - ROOM.x0, ROOM.y1 - ROOM.y0);
+    ctx.clip();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.moveTo(h.x, h.y);
+    for (const p of pts) ctx.lineTo(p[0], p[1]);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.strokeStyle = 'rgba(' + col + ',' + (0.3 + hot * 0.4) + ')';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([9, 7]);
+    ctx.lineDashOffset = -time * 12;
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+  },
+
+  human(ctx, h, time) {
+    const walk = Math.sin(h.bob) * 2.2;
+    const hot = h.alert;
+    softShadow(ctx, h.x, h.y + 12, 20, 9, 0.45);
+
+    ctx.save();
+    ctx.translate(h.x, h.y + (hot > 0.05 ? -Math.abs(Math.sin(time * 14)) * 3 * hot : 0));
+
+    // slippers
+    ctx.fillStyle = '#3f4780';
+    ctx.beginPath(); ctx.ellipse(-6, 12 + walk * 0.6, 5, 3.4, 0, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(6, 12 - walk * 0.6, 5, 3.4, 0, 0, TAU); ctx.fill();
+
+    // body: a cosy jumper
+    const bg = ctx.createLinearGradient(0, -12, 0, 14);
+    bg.addColorStop(0, '#7fd0c2'); bg.addColorStop(1, '#4f9f95');
+    ctx.fillStyle = bg;
+    rr(ctx, -13, -10, 26, 24, 11); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.14)';
+    rr(ctx, -10, -8, 7, 18, 3.5); ctx.fill();
+    ctx.fillStyle = '#6bc0b3';                                  // arms
+    ctx.beginPath(); ctx.arc(-13, 1 + walk, 5, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.arc(13, 1 - walk, 5, 0, TAU); ctx.fill();
+
+    // head, turned the way they are looking
+    ctx.save();
+    ctx.translate(0, -16);
+    ctx.rotate(h.angle + Math.PI / 2);
+    ctx.fillStyle = '#f6d7c0';
+    ctx.beginPath(); ctx.arc(0, 0, 12, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#8a5a44';                                  // hair covers the back
+    ctx.beginPath(); ctx.arc(0, 0, 12.4, 0.18, Math.PI - 0.18); ctx.fill();
+    ctx.beginPath(); ctx.arc(0, 1.5, 12.4, Math.PI - 0.5, TAU + 0.5); ctx.fill();
+    ctx.fillStyle = '#2c2440';                                  // eyes look forward
+    if (hot > 0.05) {
+      ctx.beginPath(); ctx.arc(-4.4, -5, 2.6, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(4.4, -5, 2.6, 0, TAU); ctx.fill();
+    } else {
+      ctx.beginPath(); ctx.ellipse(-4.4, -5, 1.7, 2.2, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(4.4, -5, 1.7, 2.2, 0, 0, TAU); ctx.fill();
+    }
+    ctx.fillStyle = 'rgba(255,150,170,0.35)';
+    ctx.beginPath(); ctx.ellipse(-8, -2, 2.6, 1.8, 0, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(8, -2, 2.6, 1.8, 0, 0, TAU); ctx.fill();
+    ctx.restore();
+
+    // surprise bubble
+    if (hot > 0.03) {
+      ctx.save();
+      ctx.globalAlpha = clamp(hot, 0, 1);
+      ctx.translate(0, -54 - hot * 5);
+      ctx.fillStyle = '#fff4f0';
+      ctx.beginPath(); ctx.ellipse(0, 0, 11, 12, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(-4, 9); ctx.lineTo(4, 9); ctx.lineTo(0, 15); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#e8576b';
+      rr(ctx, -2, -7, 4, 9, 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(0, 5, 2.2, 0, TAU); ctx.fill();
+      ctx.restore();
+    }
+    ctx.restore();
+  },
+
   ghost(ctx, g, time) {
     if (g.hidden) return;
     const dangerT = g.danger / DANGER_TIME;
@@ -1597,11 +2080,19 @@ const UI = {
   btnAgain: document.getElementById('btn-again'),
   intro:    document.getElementById('intro'),
   btnStart: document.getElementById('btn-start'),
-  flash:    document.getElementById('flash')
+  flash:    document.getElementById('flash'),
+  levelTitle: document.querySelector('.level-title'),
+  banner:   document.getElementById('banner'),
+  bannerTitle: document.getElementById('banner-title'),
+  bannerSub:document.getElementById('banner-sub')
 };
 
 const Game = {
   state: 'intro',            // intro | play | dying | win
+  levelIndex: 0,
+  bannerT: 0,
+  failReason: 'light',
+  actionLock: 0,             // stops one tap from toggling twice
   time: 0,
   level: null,
   ghost: null,
@@ -1659,8 +2150,12 @@ const Game = {
     tap(UI.btnRestart, () => { this.hideOverlay(); this.reset(); this.toast('Level restarted'); });
     tap(UI.btnAgain,   () => { this.hideOverlay(); this.reset(); });
     tap(UI.btnNext,    () => {
-      this.hideOverlay(); this.reset();
-      this.toast('More levels coming soon! Here is level 1 again.', 3.2);
+      if (this.levelIndex < LEVELS.length - 1) {
+        this.goToLevel(this.levelIndex + 1);
+      } else {
+        this.hideOverlay(); this.reset();
+        this.toast('More levels coming soon! Here is this one again.', 3.2);
+      }
     });
     tap(UI.btnStart,   () => {
       UI.intro.classList.add('hidden');
@@ -1672,18 +2167,36 @@ const Game = {
   },
 
   /* ---------------- level lifecycle ---------------- */
+  get def() { return LEVELS[this.levelIndex] || LEVELS[0]; },
+
   reset() {
-    this.level = buildLevel();
-    this.ghost = new Ghost(262, 826);
+    const def = this.def;
+    this.level = def.build();
+    this.ghost = new Ghost(def.spawn.x, def.spawn.y);
     this.possessed = null;
     this.target = null;
     this.hints = {};
     this.shake = 0;
     this.winT = 0;
+    this.actionLock = 0;
     Particles.clear();
-    UI.objective.textContent = 'Reach the exit';
+    UI.levelTitle.textContent = def.name;
+    UI.objective.textContent = def.objective;
     UI.objective.classList.remove('done');
     if (this.state !== 'intro') this.state = 'play';
+  },
+
+  /** Load another level with a short title card. */
+  goToLevel(i) {
+    this.levelIndex = clamp(i, 0, LEVELS.length - 1);
+    this.hideOverlay();
+    this.reset();
+    const def = this.def;
+    UI.bannerTitle.textContent = def.name;
+    UI.bannerSub.textContent = def.subtitle || '';
+    UI.banner.classList.add('show');
+    this.bannerT = 1.6;
+    if (def.startHint) this.hint('start', def.startHint, 3.4);
   },
 
   toast(msg, dur) {
@@ -1729,9 +2242,11 @@ const Game = {
       });
     }
     this.shake = 0.25;
+    this.actionLock = 0.3;
     if (p.name === 'lamp')      this.hint('h-lamp-in', 'Now press TURN OFF to kill the light');
     else if (p.name === 'car')  this.hint('h-car-in', 'Drive onto the glowing plate');
     else if (p.name === 'fan')  this.hint('h-fan-in', 'Spin it up! (not needed to escape)');
+    else if (p.spot)            this.hint('h-hide-in', 'Nobody can see you in there. Wait, then RELEASE.', 3.2);
   },
 
   doRelease() {
@@ -1753,6 +2268,7 @@ const Game = {
     Particles.burst(g.x, g.y, 20, { colors: ['#dff4ff', '#8fd8ff'], spdMax: 170 });
     Particles.spawn({ x: g.x, y: g.y, vx: 0, vy: 0, life: 0.5, size: 12, color: '#bfe9ff', shape: 'ring' });
     this.shake = 0.18;
+    this.actionLock = 0.3;
   },
 
   /** The big contextual button. */
@@ -1761,23 +2277,56 @@ const Game = {
     const p = this.possessed;
     if (p) {
       if (p.actionLabel()) p.activate();     // lamp / fan toggle
-      else this.doRelease();                 // car: the big button is RELEASE
+      else this.doRelease();                 // car / hiding spot: the button is RELEASE
       return;
     }
     const t = this.findTarget();
     if (t) this.possess(t);
   },
 
+  /** Tapping (or clicking) an object enters it — the same rules as the button. */
+  tapAt(pt) {
+    if (this.state !== 'play' || this.actionLock > 0) return;
+    const reach = 56;
+    if (this.possessed) {                         // tap what you are wearing to leave it
+      const p = this.possessed;
+      if (dist(pt.x, pt.y, p.x, p.y) < reach + p.r) this.doRelease();
+      return;
+    }
+    let best = null, bd = reach;
+    for (const o of this.level.possessables) {
+      const d = dist(pt.x, pt.y, o.x, o.y);
+      if (d < bd) { bd = d; best = o; }
+    }
+    // only objects the ghost could reach anyway, so tapping stays honest
+    if (best && dist(this.ghost.x, this.ghost.y, best.x, best.y) < POSSESS_DIST) this.possess(best);
+  },
+
   /* ---------------- failure / victory ---------------- */
-  fail() {
+  fail(reason) {
     if (this.state !== 'play') return;
     this.state = 'dying';
-    this.timer = 0.75;
+    this.failReason = reason || 'light';
+    // being spotted gets a longer beat so the "!" reads before the fade
+    this.timer = this.failReason === 'seen' ? 1.2 : 0.75;
     this.shake = 0.5;
     SFX.fail();
     const g = this.ghost;
-    Particles.burst(g.x, g.y, 32, { colors: ['#ffd2a8', '#ffffff', '#ffb38a'], spdMax: 220, grav: -40 });
+    const cols = this.failReason === 'seen'
+      ? ['#ffd6dd', '#ffffff', '#ff9fb0']
+      : ['#ffd2a8', '#ffffff', '#ffb38a'];
+    Particles.burst(g.x, g.y, 32, { colors: cols, spdMax: 220, grav: -40 });
     UI.flash.classList.add('on');
+  },
+
+  /** Caught in somebody's line of sight. */
+  spotted(h) {
+    if (this.state !== 'play') return;
+    h.alert = 1;
+    SFX.tone(880, 0.12, 'square', 0.2);
+    SFX.tone(660, 0.2, 'square', 0.16, 0, 0.1);
+    Particles.spawn({ x: h.x, y: h.y - 40, vx: 0, vy: -20, life: 0.7, size: 16, color: '#ffd0d8', shape: 'ring' });
+    this.fail('seen');
   },
 
   win() {
@@ -1799,6 +2348,7 @@ const Game = {
     }
     UI.objective.textContent = 'Escaped!';
     UI.objective.classList.add('done');
+    if (this.levelIndex < LEVELS.length - 1) UI.btnNext.textContent = 'NEXT LEVEL';
   },
 
   /* ---------------- per-frame update ---------------- */
@@ -1814,81 +2364,107 @@ const Game = {
     const L = this.level;
     if (!L) return;
 
-    // keyboard edges
+    if (this.actionLock > 0) this.actionLock -= dt;
+    if (this.bannerT > 0) {
+      this.bannerT -= dt;
+      if (this.bannerT <= 0) UI.banner.classList.remove('show');
+    }
+
+    // keyboard edges + tap-to-possess
     if (Input.takeAction()) this.doAction();
     if (Input.takeRelease()) this.doRelease();
+    const tapped = Input.takeTap();
+    if (tapped) this.tapAt(tapped);
 
     const input = (this.state === 'play') ? Input.vector() : { x: 0, y: 0, mag: 0 };
 
     if (this.state === 'play') {
       // ghost or possessed object
-      if (this.possessed === L.car) {
+      if (L.car && this.possessed === L.car) {
         L.car.update(dt, input, L);
         this.ghost.x = L.car.x; this.ghost.y = L.car.y;
       } else {
         this.ghost.update(dt, input, L);
-        L.car.update(dt, { x: 0, y: 0, mag: 0 }, L);
+        if (L.car) L.car.update(dt, { x: 0, y: 0, mag: 0 }, L);
       }
       if (this.possessed && this.possessed !== L.car) {
         this.ghost.x = this.possessed.x; this.ghost.y = this.possessed.y;
       }
     }
 
-    L.lamp.update(dt);
-    L.fan.update(dt);
+    if (L.lamp) L.lamp.update(dt);
+    if (L.fan) L.fan.update(dt);
     for (const l of L.lights) l.update(dt, this.time);
 
     this.target = this.findTarget();
     for (const p of L.possessables) p.tickCommon(dt, this.target === p);
+    for (const p of L.possessables) if (p.spot) p.update(dt);
 
-    // pressure plate <-> door
-    L.plate.update(dt, L);
-    if (L.plate.pressed === L.door.locked) {
-      L.door.setLocked(!L.plate.pressed);
-      L.doorLight.on = !L.door.locked;          // warm glow spilling in from the hall
-      if (!L.door.locked) {
-        this.shake = 0.35;
-        UI.objective.textContent = 'Door open — escape!';
-        UI.objective.classList.add('done');
-        this.hint('h-unlock', 'The exit door is unlocked!');
-      } else {
-        UI.objective.textContent = 'Keep the car on the plate';
-        UI.objective.classList.remove('done');
-        this.toast('The car rolled off — the door locked again!', 2.6);
+    // ---- housemates: patrol, then look ----
+    for (const h of L.humans) {
+      if (this.state === 'play') h.update(dt);
+      const canBeSeen = !this.possessed && !this.ghost.hidden;
+      if (this.state === 'play' && canBeSeen && h.sees(this.ghost.x, this.ghost.y, L)) {
+        this.spotted(h);
+      } else if (this.state === 'play') {
+        h.alert = Math.max(0, h.alert - dt * 1.4);
       }
     }
-    L.door.update(dt);
+
+    // pressure plate <-> door
+    if (L.plate && L.door) {
+      L.plate.update(dt, L);
+      if (L.plate.pressed === L.door.locked) {
+        L.door.setLocked(!L.plate.pressed);
+        L.doorLight.on = !L.door.locked;          // warm glow spilling in from the hall
+        if (!L.door.locked) {
+          this.shake = 0.35;
+          UI.objective.textContent = 'Door open — escape!';
+          UI.objective.classList.add('done');
+          this.hint('h-unlock', 'The exit door is unlocked!');
+        } else {
+          UI.objective.textContent = 'Keep the car on the plate';
+          UI.objective.classList.remove('done');
+          this.toast('The car rolled off — the door locked again!', 2.6);
+        }
+      }
+    }
+    if (L.door) L.door.update(dt);
 
     Particles.update(dt);
 
     // contextual hints
     if (this.state === 'play' && !this.possessed && !this.ghost.hidden) {
       const g = this.ghost;
-      if (this.target === L.lamp) this.hint('h-lamp', 'Press POSSESS to slip inside the lamp');
-      if (this.target === L.car)  this.hint('h-car', 'Possess the toy car');
-      if (!L.lampLight.on)        this.hint('h-dark', 'The doorway is safe now', 2.2);
-      if (dist(g.x, g.y, L.plate.x, L.plate.y) < L.plate.r)
+      if (L.lamp && this.target === L.lamp) this.hint('h-lamp', 'Press POSSESS to slip inside the lamp');
+      if (L.car && this.target === L.car)   this.hint('h-car', 'Possess the toy car');
+      if (L.lampLight && !L.lampLight.on)   this.hint('h-dark', 'The doorway is safe now', 2.2);
+      if (L.plate && dist(g.x, g.y, L.plate.x, L.plate.y) < L.plate.r)
         this.hint('h-plate', 'Too light! The plate needs something heavy');
       if (g.danger > 0.25) this.hint('h-burn', 'Get back in the shadows!', 2);
+      if (this.target && this.target.spot)
+        this.hint('h-hide', 'Tap it (or press POSSESS) to hide inside', 3);
     }
 
     // state transitions
     if (this.state === 'play') {
-      if (this.ghost.danger >= DANGER_TIME) this.fail();
-      else if (L.door.reached(this.ghost) && !this.possessed) this.win();
+      if (this.ghost.danger >= DANGER_TIME) this.fail('light');
+      else if (L.door && L.door.reached(this.ghost) && !this.possessed) this.win();
     } else if (this.state === 'dying') {
       this.timer -= dt;
       if (this.timer <= 0.45 && UI.flash.classList.contains('on')) {
         this.reset();
         this.state = 'play';
         UI.flash.classList.remove('on');
-        this.toast('The light got you! Try again.', 2.2);
+        this.toast(this.failReason === 'seen'
+          ? 'They spotted you! Hide next time.'
+          : 'The light got you! Try again.', 2.2);
       }
     } else if (this.state === 'win') {
       this.winT += dt;
       if (this.winT > 0.9 && UI.overlay.classList.contains('hidden')) {
-        UI.ovTitle.textContent = 'LEVEL COMPLETE!';
-        UI.ovText.textContent = 'The little ghost slipped away into the night.';
+        UI.ovTitle.textContent = this.def.winTitle || 'LEVEL COMPLETE!';
+        UI.ovText.textContent = this.def.winText || '';
         UI.overlay.classList.remove('hidden');
       }
       if (Math.random() < dt * 6) {
@@ -1946,11 +2522,12 @@ const Game = {
     }
 
     Draw.floor(ctx);
-    Draw.rug(ctx, L.rug);
-    Draw.plate(ctx, L.plate, this.time);
+    if (L.rug) Draw.rug(ctx, L.rug);
+    if (L.plate) Draw.plate(ctx, L.plate, this.time);
     Draw.lights(ctx, L, this.time);
+    for (const h of L.humans) Draw.visionCone(ctx, h, L, this.time);
     Draw.walls(ctx);
-    Draw.divider(ctx);
+    for (const d of L.dividers) Draw.divider(ctx, d);
 
     // furniture, back to front
     const furn = L.rects.filter(r => r.kind).sort((a, b) => (a.y + a.h) - (b.y + b.h));
@@ -1958,13 +2535,15 @@ const Game = {
     for (const d of L.decor) Draw.decor(ctx, d);
     for (const c of L.circles) {
       if (c.kind === 'plant') Draw.plant(ctx, c, this.time);
-      if (c.kind === 'nightlamp') Draw.nightLamp(ctx, c, L.nightLight, this.time);
+      if (c.kind === 'nightlamp' && L.nightLight) Draw.nightLamp(ctx, c, L.nightLight, this.time);
     }
 
-    Draw.lamp(ctx, L.lamp, this.time);
-    Draw.fan(ctx, L.fan, this.time);
-    Draw.car(ctx, L.car, this.time);
-    Draw.door(ctx, L.door, this.time);
+    if (L.lamp) Draw.lamp(ctx, L.lamp, this.time);
+    if (L.fan) Draw.fan(ctx, L.fan, this.time);
+    if (L.car) Draw.car(ctx, L.car, this.time);
+    for (const o of L.possessables) if (o.spot) Draw.hideSpot(ctx, o, this.time);
+    for (const h of L.humans) Draw.human(ctx, h, this.time);
+    if (L.door) Draw.door(ctx, L.door, this.time);
 
     Draw.ghost(ctx, this.ghost, this.time);
     Particles.draw(ctx);
