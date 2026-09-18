@@ -1,5 +1,5 @@
 /* =============================================================================
-   GHOST ESCAPE — Level 1 prototype
+   GHOST ESCAPE
    Vanilla HTML5 / Canvas. No dependencies.
 
    Systems in this file, in order:
@@ -8,9 +8,10 @@
      2. Particles    — one flat particle pool
      3. Input        — keyboard + invisible drag-to-move + action buttons
      4. Collision    — circle vs AABB / circle, swept-ish resolve
-     5. Entities     — Ghost, Possessable(Lamp/ToyCar/Fan), PressurePlate,
-                       ExitDoor, LightHazard
-     6. Level        — the single room for level 1
+     5. Entities     — Ghost, Possessable objects (lamps, fan, car, hideouts,
+                       noisemakers), PressurePlate, Gate, KeyPickup, ExitDoor,
+                       LightHazard, Human
+     6. Levels       — six self-contained rooms
      7. Render       — procedural cozy room drawing
      8. Game         — state machine, loop, UI glue
    ============================================================================= */
